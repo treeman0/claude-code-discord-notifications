@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "treeman0",
+  "owner": {
+    "name": "treeman0"
+  },
+  "description": "Discord notifications for Claude Code, with optional round-trip questions",
+  "plugins": [
+    {
+      "name": "claude-code-discord-notifications",
+      "source": "./",
+      "description": "Pings you on Discord when Claude finishes, asks a question, or hits an error. Optionally, lets Claude ask you questions with tappable buttons and wait for your reply from your phone.",
+      "category": "notifications",
+      "keywords": ["discord", "notifications", "hooks", "messaging", "round-trip"]
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/notify.sh", "args": [], "timeout": 10 }] }
+    ],
+    "Notification": [
+      { "matcher": "permission_prompt|idle_prompt",
+        "hooks": [{ "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/notify.sh", "args": [], "timeout": 10 }] }
+    ],
+    "StopFailure": [
+      { "hooks": [{ "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/notify.sh", "args": [], "timeout": 10 }] }
+    ]
+  }
+}
