@@ -43,18 +43,78 @@ def read_info():
         return None
 
 
+def _pid_running(pid: int) -> bool:
+    """Cross-platform check whether `pid` belongs to a running process.
+
+    On Unix, os.kill(pid, 0) signals nothing and either succeeds or raises.
+    On Windows, os.kill(pid, 0) actually delivers CTRL_C, which is wrong for
+    a liveness check — and on MSYS Python it can lie outright. Use OpenProcess
+    on Windows via ctypes for an accurate read.
+    """
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
+            )
+            if not handle:
+                # Could be access denied or "no such process". The most common
+                # case is "no such process" → treat as not running.
+                err = ctypes.get_last_error()
+                # ERROR_INVALID_PARAMETER (87) is what you get for a missing PID.
+                # ERROR_ACCESS_DENIED (5) means the process EXISTS but we can't
+                # query it — treat as running to be safe.
+                return err == 5
+            # Process opened — check exit code to confirm it's still active.
+            STILL_ACTIVE = 259
+            exit_code = ctypes.c_ulong()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                running = (exit_code.value == STILL_ACTIVE)
+            else:
+                running = True  # opened but couldn't read — assume running
+            kernel32.CloseHandle(handle)
+            return running
+        except Exception:
+            return False
+    # POSIX
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
 def daemon_alive() -> bool:
-    """The info file exists AND the PID it references is running."""
+    """The info file exists AND the PID it references is running AND the
+    socket port it claims is actually accepting connections.
+
+    All three checks matter on Windows because:
+    - Info file can be stale (old daemon died without cleanup)
+    - PID can be reused by an unrelated process
+    - The daemon might be midway through shutdown
+    """
     info = read_info()
     if not info:
         return False
+    pid = info.get("pid")
+    if not pid or not _pid_running(int(pid)):
+        return False
+    # Verify the port is open. If it isn't, the info file is stale.
+    port = info.get("port")
+    if not port:
+        return False
     try:
-        os.kill(int(info["pid"]), 0)
-    except OSError:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(("127.0.0.1", int(port)))
+        s.close()
+        return True
+    except (OSError, socket.timeout):
         return False
-    except KeyError:
-        return False
-    return True
 
 
 def start_daemon(daemon_script: str) -> bool:

@@ -89,12 +89,16 @@ Discord bots can only DM users who share a server with them:
 1. Pick a server they can add the bot to, or create a private one (Discord sidebar → "+" → "Create My Own" → "For me and my friends").
 
 2. Back at https://discord.com/developers/applications → their bot → left sidebar → **OAuth2** → **OAuth2 URL Generator** (newer UI: **Installation**):
-   - **SCOPES**: check `bot`
+   - **SCOPES**: check **BOTH** `bot` AND `applications.commands`
+     - `bot` lets the bot send messages
+     - `applications.commands` lets the bot **respond to button taps** (without it, every button shows "This interaction failed" on your phone)
    - **BOT PERMISSIONS**: check `Send Messages`
    - Copy the generated URL
    - Open it, pick the server, click **Authorize**
 
 3. After authorizing, the bot appears in the server's member list. It's offline (fine — comes online when the daemon starts).
+
+> If you already invited the bot with only `bot` and your buttons aren't working: redo this step with `applications.commands` also checked, then open the new URL and click Authorize again. Discord will update the existing install — you don't need to remove and re-add.
 
 ## Step 6 — Save credentials
 

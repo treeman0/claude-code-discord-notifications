@@ -664,9 +664,30 @@ def write_pid():
 
 
 def cleanup():
+    """Remove our info/pid files — but ONLY if they reference our PID.
+
+    Critical safety: if another daemon process owns these files, we must NOT
+    delete them. Without this guard, a second-daemon-attempt would clobber the
+    first daemon's state when it exits via the single-instance guard.
+    """
+    my_pid = os.getpid()
     for p in (INFO_FILE, PID_FILE):
         try:
-            p.unlink()
+            if not p.exists():
+                continue
+            owner_pid = None
+            try:
+                raw = p.read_text(encoding="utf-8").strip()
+                if p == INFO_FILE:
+                    owner_pid = int(json.loads(raw).get("pid", 0))
+                else:
+                    owner_pid = int(raw)
+            except Exception:
+                # Unparseable; treat as orphan and remove (only safe if we're
+                # the one starting up — but here we're in cleanup. Skip.)
+                continue
+            if owner_pid == my_pid:
+                p.unlink()
         except FileNotFoundError:
             pass
         except Exception:
@@ -678,6 +699,14 @@ async def main():
     if "DISCORD_BOT_TOKEN" not in env or "DISCORD_USER_ID" not in env:
         log.error("env file missing DISCORD_BOT_TOKEN or DISCORD_USER_ID")
         sys.exit(2)
+
+    # Single-instance guard: if another daemon is already running AND its
+    # TCP port is accepting connections, exit immediately. Without this,
+    # repeated client invocations on Windows (where os.kill liveness checks
+    # are unreliable) accumulate orphan daemons.
+    if _another_daemon_alive():
+        log.info("another daemon is already running and healthy; exiting")
+        sys.exit(0)
 
     write_pid()
     daemon = Daemon(env)
@@ -708,7 +737,60 @@ async def main():
         log.info("daemon stopped")
 
 
+def _another_daemon_alive() -> bool:
+    """Check if INFO_FILE points at a healthy running daemon (PID alive AND
+    port answering)."""
+    try:
+        if not INFO_FILE.exists():
+            return False
+        info = json.loads(INFO_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    pid = info.get("pid", 0)
+    port = info.get("port", 0)
+    if not pid or not port:
+        return False
+    # Liveness — use the same cross-platform PID check as the client.
+    if os.name == "nt":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, int(pid))
+            if not handle:
+                return False
+            STILL_ACTIVE = 259
+            exit_code = ctypes.c_ulong()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                running = (exit_code.value == STILL_ACTIVE)
+            else:
+                running = True
+            kernel32.CloseHandle(handle)
+            if not running:
+                return False
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(int(pid), 0)
+        except OSError:
+            return False
+    # Liveness OK — confirm TCP port answers.
+    import socket as _socket
+    try:
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(("127.0.0.1", int(port)))
+        s.close()
+        return True
+    except (OSError, _socket.timeout):
+        return False
+
+
 if __name__ == "__main__":
+    import atexit
+    # Always try to clean up our pid/info files on exit, even on hard kills
+    # where the asyncio finally clause didn't run.
+    atexit.register(cleanup)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
