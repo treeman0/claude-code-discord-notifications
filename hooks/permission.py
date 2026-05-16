@@ -20,7 +20,12 @@ Honored env vars:
                                     base plugin — every tool gets the normal
                                     Claude Code prompt).
     CC_DISCORD_PERMISSION_TIMEOUT   Seconds to wait for a Discord reply
-                                    (default 60).
+                                    on tool-permission prompts before
+                                    falling back to the terminal (default
+                                    10 — the "race window"). The
+                                    AskUserQuestion path uses a separate,
+                                    longer default (180s) since those are
+                                    real questions to the user, not gates.
     CC_DISCORD_PERMISSION_SKIP      Comma-separated tool names that always
                                     auto-allow (default: read-only tools).
     CC_DISCORD_PERMISSION_BASH_SAFE Override the safe-Bash regex.
@@ -516,14 +521,18 @@ def main():
         # Misinstall; fall back gracefully.
         sys.exit(0)
 
-    timeout = float(os.environ.get("CC_DISCORD_PERMISSION_TIMEOUT", "60"))
+    # Race window: how long the hook is willing to wait for a Discord
+    # response on a permission prompt before giving up and letting Claude
+    # Code show its own terminal prompt. Short by default so the user isn't
+    # stuck if they're at the terminal anyway.
+    timeout = float(os.environ.get("CC_DISCORD_PERMISSION_TIMEOUT", "10"))
 
     # Special handling for AskUserQuestion: send each question with its real
     # options as buttons, collect the answers, return them as updatedInput.
     if tool_name == "AskUserQuestion":
-        # Allow a longer timeout per question for AskUserQuestion since these
-        # are real decisions, not yes/no.
-        auq_timeout = float(os.environ.get("CC_DISCORD_PERMISSION_TIMEOUT", "180"))
+        # AskUserQuestion is a real question to the user (the model is
+        # asking, not gating). Hold longer so the user can reach their phone.
+        auq_timeout = float(os.environ.get("CC_DISCORD_ASKUSER_TIMEOUT", "180"))
         handle_ask_user_question(tool_input, cwd, client, daemon, auq_timeout)
         return  # not reached — the handler always exits
 

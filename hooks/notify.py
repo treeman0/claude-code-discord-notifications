@@ -146,8 +146,12 @@ def main():
                 pass
     elif event == "Notification":
         if notif_type == "permission_prompt":
-            title = "🔐 Claude Code wants permission"
-            body = msg or "Claude is asking to use a tool."
+            # The PreToolUse hook already raced an interactive Discord ask
+            # against the terminal prompt (default 10s window). If it timed
+            # out, the daemon edited the original DM to "timed out". Sending
+            # another "Claude wants permission" DM here would just duplicate.
+            # Stay silent and let the terminal handle the residual.
+            safe_exit()
         elif notif_type == "idle_prompt":
             title = "❓ Claude Code is waiting on you"
             body = msg or "Claude is asking a question."
