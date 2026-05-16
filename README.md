@@ -19,6 +19,17 @@ The plugin registers a `PreToolUse` hook. Before Claude can run anything that mo
 - **Everything else:** DMed to you with two buttons. Default 60-second window for you to answer. Approve → Claude proceeds. Deny → Claude stops with the reason "Denied on Discord."
 - **If Discord is unreachable** (daemon down, phone offline, no answer within the timeout): falls back to Claude Code's normal in-terminal prompt. No silent allows.
 
+### Claude's clarifying questions (`AskUserQuestion`)
+
+When Claude uses the `AskUserQuestion` tool (it does this often in plan mode), the plugin recognizes it and sends each of Claude's questions to Discord with **the actual options Claude offered as tappable buttons** — not just approve/deny.
+
+- One DM per question. With multiple questions, an intro DM lists them all first so you know what's coming.
+- Buttons match Claude's actual labels ("Immediate failure", "With retry", "Custom handler", etc.). Tap one, that becomes the answer.
+- For multi-select questions: tap one option, or reply with a comma-separated list of labels (`"Python, Rust"`).
+- Free-text replies are matched case-insensitively against labels (so typing `yes` matches button `Yes`).
+- Default 180-second timeout per question.
+- If Discord is unreachable or your reply can't be matched to a label, falls back to the normal in-terminal prompt for that question.
+
 Configure via env vars in `~/.claude/.discord.env`:
 
 ```

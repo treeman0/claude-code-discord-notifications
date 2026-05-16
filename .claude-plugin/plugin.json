@@ -1,7 +1,7 @@
 {
   "name": "claude-code-discord-notifications",
-  "version": "1.2.0",
-  "description": "Discord remote co-pilot for Claude Code. DMs you when Claude finishes, asks, or hits an error. Asks for approval before tool calls via tappable buttons. Rolls up tool usage at end of turn. Optional round-trip questions.",
+  "version": "1.3.0",
+  "description": "Discord remote co-pilot for Claude Code. DMs you when Claude finishes, asks, or hits an error. Approves tool calls via tappable buttons. Handles AskUserQuestion with the actual options Claude offered (not just approve/deny). Rolls up tool usage at end of turn. Optional round-trip questions.",
   "author": {
     "name": "treeman0"
   },
