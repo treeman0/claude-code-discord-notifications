@@ -91,7 +91,7 @@ What runs:
 
 ## Daemon lifecycle
 
-**Lazy-started** the first time the hook or `/ask-discord` runs. Then keeps running until you reboot or explicitly stop it. Check status:
+**Auto-started** by a `SessionStart` hook the moment a new Claude Code session opens (set `CC_DISCORD_AUTOSTART=off` to skip). If autostart is disabled or skipped, the daemon is still lazy-started the first time a hook or `/ask-discord` fires. Once up, it keeps running until you reboot or explicitly stop it. Check status:
 
 ```
 /discord-status
@@ -173,6 +173,8 @@ Stop the daemon: `python3 ~/.claude/plugins/cache/claude-code-discord-notificati
   plugin.json          plugin manifest
 hooks/
   hooks.json           hook registrations (auto-applied)
+  sessionstart.py      SessionStart — spawns the daemon at session open
+  inbox.py             UserPromptSubmit — drains queued Discord DMs into context
   permission.py        PreToolUse — Discord approval for risky tools
   posttool.py          PostToolUse — accumulates per-turn tool summary
   notify.py            Stop / Notification / StopFailure — DMs the user
