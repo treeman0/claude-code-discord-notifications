@@ -524,8 +524,19 @@ def main():
     # Race window: how long the hook is willing to wait for a Discord
     # response on a permission prompt before giving up and letting Claude
     # Code show its own terminal prompt. Short by default so the user isn't
-    # stuck if they're at the terminal anyway.
+    # stuck if they're at the terminal anyway. Only used in "race" mode.
     timeout = float(os.environ.get("CC_DISCORD_PERMISSION_TIMEOUT", "10"))
+
+    # Two interaction modes for tool-permission prompts:
+    #   parallel (default) — the hook returns "ask" immediately so the
+    #     terminal prompt appears at once; the Discord ask is sent in
+    #     parallel from the Notification(permission_prompt) hook (notify.py).
+    #     The user can see the prompt on their phone but the *terminal* is
+    #     the decider — Discord clicks just acknowledge.
+    #   race — the hook blocks for `timeout` seconds waiting for Discord;
+    #     if Discord answers in time, it decides; if not, falls back to
+    #     terminal. Terminal is hidden during the race.
+    permission_mode = os.environ.get("CC_DISCORD_PERMISSION_MODE", "parallel").lower()
 
     # Special handling for AskUserQuestion: send each question with its real
     # options as buttons, collect the answers, return them as updatedInput.
@@ -535,6 +546,12 @@ def main():
         auq_timeout = float(os.environ.get("CC_DISCORD_ASKUSER_TIMEOUT", "180"))
         handle_ask_user_question(tool_input, cwd, client, daemon, auq_timeout)
         return  # not reached — the handler always exits
+
+    # parallel mode: defer to terminal + leave it to notify.py to send
+    # the Discord prompt. No Discord interaction from this hook.
+    if permission_mode == "parallel":
+        ask_fallback("parallel mode — terminal and Discord prompted simultaneously")
+        return  # not reached
 
     text = build_prompt(tool_name, tool_input, cwd)
 

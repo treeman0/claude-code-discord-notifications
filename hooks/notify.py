@@ -14,6 +14,7 @@ Always exits 0 so a notification hiccup never blocks Claude Code.
 """
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -146,11 +147,57 @@ def main():
                 pass
     elif event == "Notification":
         if notif_type == "permission_prompt":
-            # The PreToolUse hook already raced an interactive Discord ask
-            # against the terminal prompt (default 10s window). If it timed
-            # out, the daemon edited the original DM to "timed out". Sending
-            # another "Claude wants permission" DM here would just duplicate.
-            # Stay silent and let the terminal handle the residual.
+            # In "parallel" mode (default) the PreToolUse hook returns
+            # "ask" immediately so the terminal prompt shows at once. We
+            # send the Discord interactive ask from here, detached, so the
+            # two prompts appear simultaneously. The Discord click is
+            # acknowledged by the daemon (edits the DM) but does not feed
+            # back into the terminal decision — the user still confirms
+            # at the terminal. In "race" mode the PreToolUse hook handled
+            # the Discord ask itself, so we stay silent here to avoid
+            # duplicates.
+            permission_mode = os.environ.get("CC_DISCORD_PERMISSION_MODE", "parallel").lower()
+            if permission_mode != "parallel":
+                safe_exit()
+
+            text = f"**🔐 Claude wants permission**\n{msg or 'Tool approval needed.'}"
+            if cwd:
+                text += f"\n📂 `{Path(cwd).name}`"
+
+            # Find sibling scripts.
+            here = Path(__file__).resolve().parent
+            plugin_root = here.parent
+            client = plugin_root / "bin" / "discord-client.py"
+            daemon = plugin_root / "bin" / "discord-daemon.py"
+            if not client.exists():
+                safe_exit()
+
+            # Spawn the interactive ask in a detached subprocess. Stdout/err
+            # are discarded — nobody listens. The daemon will edit the DM
+            # to show "you tapped …" on click, or "timed out" otherwise.
+            env = os.environ.copy()
+            env["CC_DISCORD_DAEMON"] = str(daemon)
+            timeout = os.environ.get("CC_DISCORD_PERMISSION_TIMEOUT", "60")
+            try:
+                popen_kwargs = {
+                    "stdin": subprocess.DEVNULL,
+                    "stdout": subprocess.DEVNULL,
+                    "stderr": subprocess.DEVNULL,
+                    "env": env,
+                }
+                if os.name == "nt":
+                    popen_kwargs["creationflags"] = 0x00000200 | 0x00000008
+                else:
+                    popen_kwargs["start_new_session"] = True
+                subprocess.Popen(
+                    [sys.executable, str(client), "ask", text,
+                     "--option", "✅ Approve",
+                     "--option", "❌ Deny",
+                     "--timeout", timeout],
+                    **popen_kwargs,
+                )
+            except Exception:
+                pass
             safe_exit()
         elif notif_type == "idle_prompt":
             title = "❓ Claude Code is waiting on you"
@@ -196,7 +243,6 @@ def main():
     # Run the client. Inherit our Python interpreter — that's the one with
     # websockets, presumably. Fire and forget; suppress all output, never block
     # Claude Code.
-    import subprocess
     env = os.environ.copy()
     env["CC_DISCORD_DAEMON"] = str(daemon)
 
