@@ -1,14 +1,38 @@
 {
   "hooks": {
     "Stop": [
-      { "hooks": [{ "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/notify.sh", "args": [], "timeout": 10 }] }
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/notify.py\"",
+            "timeout": 15
+          }
+        ]
+      }
     ],
     "Notification": [
-      { "matcher": "permission_prompt|idle_prompt",
-        "hooks": [{ "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/notify.sh", "args": [], "timeout": 10 }] }
+      {
+        "matcher": "permission_prompt|idle_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/notify.py\"",
+            "timeout": 15
+          }
+        ]
+      }
     ],
     "StopFailure": [
-      { "hooks": [{ "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/notify.sh", "args": [], "timeout": 10 }] }
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/notify.py\"",
+            "timeout": 15
+          }
+        ]
+      }
     ]
   }
 }

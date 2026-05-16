@@ -3,11 +3,13 @@
 A Claude Code plugin that DMs you on **Discord** when Claude:
 
 - ✅ **finishes** a turn
-- ❓ **asks you a question** or goes idle waiting
+- ❓ **asks a question** or goes idle waiting
 - 🔐 **wants permission** to run a tool
-- 🛑 **hits an API error** that needs your attention (rate limit, auth, billing, server, max output tokens)
+- 🛑 **hits an API error** (rate limit, auth, billing, server, max output tokens)
 
 And, optionally — the part you actually came for — **Claude can ask you a question on Discord and wait for your reply, with tappable buttons**. You tap an option on your phone (or type a free-form answer), Claude reads it back, conversation continues.
+
+Cross-platform: macOS, Linux, and Windows (Git Bash / MSYS / native).
 
 ## Install
 
@@ -19,7 +21,7 @@ Inside Claude Code:
 /discord-setup
 ```
 
-The wizard walks you through creating a Discord bot, getting your user ID, inviting the bot to a server you share with it, and verifying everything end-to-end. ~5 minutes.
+`/discord-setup` walks you through creating a Discord bot, getting your user ID, inviting the bot to a server you share, and verifying everything works. ~5 minutes.
 
 ## How round-trip works
 
@@ -29,48 +31,38 @@ Once set up, you have a new command: `/ask-discord`.
 /ask-discord Should I deploy? -- yes | no | wait
 ```
 
-Claude sends a DM to your phone with three tappable buttons. The command **blocks** until you tap one (or reply with text), then the answer appears in Claude's context and the conversation continues. Free-form works too:
+Claude sends a DM to your phone with three tappable buttons. The command **blocks** until you tap one (or reply with text), then the answer appears in Claude's context. Free-form works too:
 
 ```
 /ask-discord What should the commit message be?
 ```
 
-You type the answer back on Discord, Claude reads it. Default timeout is 10 minutes; pass `--timeout 1800` for 30.
+You type the answer back on Discord, Claude reads it. Default timeout 10 min; pass `--timeout 1800` for 30.
 
 You can also instruct Claude to use it itself — e.g. in your project's `CLAUDE.md`:
 
 > When you need a decision from me and I might be away from the keyboard, use `/ask-discord` with buttons instead of stopping and waiting.
 
-## What gets installed
-
-Three hooks register automatically when you install the plugin:
-
-| Event | What triggers it |
-| --- | --- |
-| `Stop` | Claude finishes a turn |
-| `Notification` (`permission_prompt`, `idle_prompt`) | Claude needs your input |
-| `StopFailure` | API error ended the turn |
-
-Plus three slash commands: `/discord-setup`, `/ask-discord`, `/discord-status`.
-
-`PostToolUseFailure` is off by default — it fires on every failed tool call, including ones Claude recovers from on its own. To enable, add a hook for it in `~/.claude/settings.json`.
-
 ## Architecture
 
-A small Python daemon (`discord-daemon.py`) keeps a persistent WebSocket connection to Discord's gateway. The hook script and slash commands talk to it over a Unix socket at `~/.claude/discord-daemon.sock`. The daemon owns:
+A small Python daemon (`discord-daemon.py`) keeps a persistent WebSocket connection to Discord's gateway. The hook script and slash commands talk to it over a **TCP loopback socket** (127.0.0.1:`<random_port>`). The daemon writes its port + auth token to `~/.claude/discord-daemon.info` on startup; clients read that file to find the daemon.
 
-- Sending DMs (one-way notifications)
-- Posting messages with action-row buttons
-- Listening for button clicks (`INTERACTION_CREATE`) and DM replies (`MESSAGE_CREATE` in DM channels)
-- Matching replies back to open questions and signaling waiting CLI clients
+Why TCP loopback and not Unix sockets? CPython on Windows doesn't expose `socket.AF_UNIX` (it's an open issue from 2018). TCP loopback works identically on every platform.
 
-**No public IP, no tunnel, no webhook.** Discord's gateway is a single outbound WebSocket — replies arrive in real time without anything special on your side. This is why Discord works for round-trip where WhatsApp doesn't.
+What runs:
 
-**No privileged intents needed.** Discord delivers DM message content to bots without the `MESSAGE_CONTENT` intent, and button clicks arrive as `INTERACTION_CREATE` which doesn't need any intent at all. So the bot's permissions are minimal: it can DM you, you can DM it back, and it cannot read anything else.
+- **Sending DMs** (one-way notifications)
+- **Posting messages with action-row buttons**
+- **Listening for button clicks** (`INTERACTION_CREATE`) and **DM replies** (`MESSAGE_CREATE` in DM channels)
+- **Matching replies back to open questions** and signaling waiting CLI clients
+
+**No public IP, no tunnel, no webhook.** Discord's gateway is a single outbound WebSocket — replies arrive in real time without anything special on your network.
+
+**No privileged intents needed.** Discord delivers DM message content to bots without `MESSAGE_CONTENT` (DMs are exempt from that restriction), and button clicks arrive as `INTERACTION_CREATE` which needs no intent at all. The bot's permissions are minimal: it DMs you, you DM it back, and it cannot read anything else.
 
 ## Daemon lifecycle
 
-The daemon is **lazy-started** the first time the hook or `/ask-discord` runs. It then keeps running until you reboot or explicitly stop it. Check status:
+**Lazy-started** the first time the hook or `/ask-discord` runs. Then keeps running until you reboot or explicitly stop it. Check status:
 
 ```
 /discord-status
@@ -79,27 +71,54 @@ The daemon is **lazy-started** the first time the hook or `/ask-discord` runs. I
 Or directly:
 
 ```bash
-python3 ~/.claude/plugins/cache/claude-code-discord-notifications/<version>/bin/discord-client.py status
-python3 ~/.claude/plugins/cache/claude-code-discord-notifications/<version>/bin/discord-client.py stop
+python3 "$CLAUDE_PLUGIN_ROOT/bin/discord-client.py" status
+python3 "$CLAUDE_PLUGIN_ROOT/bin/discord-client.py" stop
 ```
 
-The daemon writes a PID file at `~/.claude/discord-daemon.pid` and logs to `~/.claude/discord-daemon.log`.
+(Where `$CLAUDE_PLUGIN_ROOT` is set automatically inside Claude Code; outside, the daemon lives at `~/.claude/plugins/cache/claude-code-discord-notifications/<version>/bin/`.)
+
+The daemon writes a PID file at `~/.claude/discord-daemon.pid`, the info file at `~/.claude/discord-daemon.info`, and logs to `~/.claude/discord-daemon.log`.
 
 ## Requirements
 
-- **Python 3.8+** (everywhere except Windows-without-WSL, which won't work — the Unix socket isn't supported on native Windows)
-- **`websockets`** package — `/discord-setup` installs it for you via `pip install --user`
-- **`curl` and `jq`** on PATH (macOS: `curl` ships, `brew install jq`. Debian/Ubuntu: `sudo apt install jq`)
-- A **Discord account** and a **server you can invite the bot to** (a private server-of-one works fine)
+- **Python 3.8+** on PATH as `python3`.
+  - macOS / most Linux distros: already present.
+  - Windows: install python.org Python (or use the one MSYS provides if it has pip). See **Windows notes** below.
+- **`websockets`** package — `/discord-setup` installs it via `pip install --user`.
+- A **Discord account** and a **server you can invite the bot to** (a private server-of-one works fine).
+
+### Windows notes
+
+The hook is a Python script (`hooks/notify.py`) invoked via `python3` in `hooks.json`. So whatever `python3` resolves to on your PATH must:
+
+1. Be a working Python 3.8+ installation
+2. Have `pip` available (or pip-installed `websockets` already)
+
+The most reliable setup on Windows is:
+
+1. Install Python from python.org (gives you `py` launcher with pip).
+2. Make sure `python3` resolves to it. The easiest way: from cmd/PowerShell run
+
+   ```
+   echo @py -3 %%* > "%USERPROFILE%\AppData\Local\Microsoft\WindowsApps\python3.bat"
+   ```
+
+   That dir is on Windows PATH by default, so `python3` will now mean "Python 3 via the py launcher" in any new terminal.
+
+3. Verify: `python3 -c "import websockets"` in a fresh shell.
+
+4. Restart Claude Code so it picks up the new PATH.
+
+If you only have MSYS Python (`/c/msys64/mingw64/bin/python3`), you can install pip into it via `pacman -S mingw-w64-x86_64-python-pip` from an MSYS terminal, then `pip install websockets`. The plugin will work either way.
 
 ## Customize
 
-Variables you can set in `~/.claude/.discord.env`:
+Variables you can set in the env file or shell:
 
 - `CC_DISCORD_INCLUDE_DIR=0` — drop the working-directory line from messages
 - `CC_DISCORD_DEBUG=1` — verbose logging to `~/.claude/cc-discord.log`
 
-The `Stop` hook fires every turn, which can be chatty. To get pings only for questions / permissions / errors, remove the `Stop` block from `~/.claude/settings.json` or disable just it via `/hooks`.
+The `Stop` hook fires every turn, which can be chatty. To get pings only for questions / permissions / errors, edit `~/.claude/settings.json` and remove the `Stop` entry — or use `/hooks` to disable just that one.
 
 ## Update
 
@@ -116,11 +135,7 @@ If the daemon's running, stop and restart it after updating: `python3 .../bin/di
 /plugin uninstall claude-code-discord-notifications@treeman0
 ```
 
-Removes the plugin and unregisters the hooks. Credentials at `~/.claude/.discord.env` stay — delete that yourself if you're done. Stop the daemon manually too:
-
-```
-python3 ~/.claude/plugins/cache/claude-code-discord-notifications/*/bin/discord-client.py stop
-```
+Stop the daemon: `python3 ~/.claude/plugins/cache/claude-code-discord-notifications/*/bin/discord-client.py stop`. Delete credentials: `rm ~/.claude/.discord.env` (`del %USERPROFILE%\.claude\.discord.env` on Windows cmd).
 
 ## Files
 
@@ -130,24 +145,26 @@ python3 ~/.claude/plugins/cache/claude-code-discord-notifications/*/bin/discord-
   plugin.json          plugin manifest
 hooks/
   hooks.json           hook registrations (auto-applied)
-  notify.sh            fires on Stop/Notification/StopFailure
+  notify.py            fires on Stop/Notification/StopFailure
 commands/
   discord-setup.md     /discord-setup wizard
   ask-discord.md       /ask-discord round-trip question
   discord-status.md    /discord-status daemon health
 bin/
-  discord-daemon.py    long-running gateway WebSocket client
-  discord-client.py    CLI: talks to the daemon over Unix socket
+  discord-daemon.py    long-running gateway WebSocket client + TCP IPC server
+  discord-client.py    CLI: talks to the daemon over TCP loopback
 scripts/
-  test-discord.sh      credential test helper (used by /discord-setup)
+  test_discord.py      credential test helper (used by /discord-setup)
 ```
 
 ## Troubleshooting
 
-**The daemon won't start.** Check `~/.claude/discord-daemon.log`. Most likely: `websockets` isn't installed (`python3 -m pip install --user websockets`), or the env file is missing/malformed.
+**"Stop hook error: Failed to run: EFTYPE: inappropriate file type or format" on Windows.** That was an old `.sh` hook — make sure you're on the latest version where the hook is `notify.py`.
 
-**I tap a button but Claude doesn't continue.** The daemon should ACK the button click within 3 seconds. If you see the button greyed out / message edited to show the answer, the daemon got it. If `/ask-discord` is still hanging, check that the daemon's pending count went down: `/discord-status`.
+**The daemon won't start.** Check `~/.claude/discord-daemon.log`. Most likely: `websockets` isn't installed, or `python3` doesn't resolve to a working interpreter, or the env file is missing/malformed.
 
-**No DM arrives.** Run `/discord-setup` to re-test credentials, or directly: `bash $CLAUDE_PLUGIN_ROOT/scripts/test-discord.sh <token> <user_id>`. The most common cause is the bot not sharing a server with you (step 5 of setup).
+**I tap a button but Claude doesn't continue.** The daemon should ACK the button click within 3 seconds. If the message gets edited to show your answer (and the buttons disappear), the daemon got it. If `/ask-discord` is still hanging, check pending count: `/discord-status`.
 
-**Daemon hangs after a long period.** Discord's gateway sends `RECONNECT` (op 7) periodically; the daemon handles this. If something pathological happens, just stop and restart it.
+**No DM arrives.** Re-test credentials: `python3 "$CLAUDE_PLUGIN_ROOT/scripts/test_discord.py" <token> <user_id>`. Most common cause: bot doesn't share a server with you (step 5 of setup).
+
+**`python3 -m pip` says "No module named pip" on MSYS.** Your MSYS Python has no pip. Either install pip via pacman (`pacman -S mingw-w64-x86_64-python-pip` from an MSYS terminal), or set up a `python3.bat` shim to use Windows Python (see **Windows notes** above).

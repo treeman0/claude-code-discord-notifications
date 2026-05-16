@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-discord-client: thin CLI that talks to the running discord-daemon over its
-Unix socket. Used by the hook script and the slash commands.
+discord-client: thin CLI that talks to the running discord-daemon over a TCP
+loopback socket (127.0.0.1:<port>). Used by the hook script and slash commands.
 
-If the daemon isn't running, this script starts it automatically before sending
-the request (lazy start). Pass --no-start to disable.
+Discovers the daemon via ~/.claude/discord-daemon.info (port + auth token).
+If the daemon isn't running, this script starts it automatically before
+sending the request (lazy start). Pass --no-start to disable.
+
+Cross-platform: works on macOS, Linux, and Windows (avoids AF_UNIX which is
+not available in CPython on Windows).
 
 Usage:
     discord-client notify "Claude finished"
     discord-client ask "Should I deploy?" --option yes --option no
-    discord-client ask "What's the commit message?"         # free-form
+    discord-client ask "What's the commit message?"
     discord-client status
     discord-client stop
 """
@@ -23,21 +27,32 @@ import time
 from pathlib import Path
 
 HOME = Path.home()
-SOCK_PATH = Path(os.environ.get("CC_DISCORD_SOCK", HOME / ".claude" / "discord-daemon.sock"))
-PID_FILE = HOME / ".claude" / "discord-daemon.pid"
+CLAUDE_DIR = HOME / ".claude"
+INFO_FILE = Path(os.environ.get("CC_DISCORD_INFO", CLAUDE_DIR / "discord-daemon.info"))
+PID_FILE = CLAUDE_DIR / "discord-daemon.pid"
 DAEMON_SCRIPT_ENV = "CC_DISCORD_DAEMON"
 
 
+def read_info():
+    """Return {port, token, pid, ...} from the info file, or None."""
+    if not INFO_FILE.exists():
+        return None
+    try:
+        return json.loads(INFO_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
 def daemon_alive() -> bool:
-    if not PID_FILE.exists():
+    """The info file exists AND the PID it references is running."""
+    info = read_info()
+    if not info:
         return False
     try:
-        pid = int(PID_FILE.read_text().strip())
-    except (ValueError, OSError):
-        return False
-    try:
-        os.kill(pid, 0)
+        os.kill(int(info["pid"]), 0)
     except OSError:
+        return False
+    except KeyError:
         return False
     return True
 
@@ -47,36 +62,45 @@ def start_daemon(daemon_script: str) -> bool:
     if not Path(daemon_script).exists():
         print(f"error: daemon script not found at {daemon_script}", file=sys.stderr)
         return False
-    log_path = HOME / ".claude" / "discord-daemon.log"
+    log_path = CLAUDE_DIR / "discord-daemon.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(log_path, "ab") as logfp:
-        subprocess.Popen(
-            [sys.executable, daemon_script],
-            stdin=subprocess.DEVNULL,
-            stdout=logfp,
-            stderr=logfp,
-            start_new_session=True,
-        )
-    # Wait for socket to appear, indicating the daemon is listening.
+    # Detach: new process group on Unix, new console flag on Windows.
+    kwargs = {"stdin": subprocess.DEVNULL}
+    log_fp = open(log_path, "ab")
+    kwargs["stdout"] = log_fp
+    kwargs["stderr"] = log_fp
+    if os.name == "nt":
+        # CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
+        kwargs["creationflags"] = 0x00000200 | 0x00000008
+    else:
+        kwargs["start_new_session"] = True
+
+    subprocess.Popen([sys.executable, daemon_script], **kwargs)
+
+    # Wait for info file to appear, indicating daemon is listening.
     for _ in range(150):  # ~15s
-        if SOCK_PATH.exists():
+        if INFO_FILE.exists() and read_info() is not None:
             return True
         time.sleep(0.1)
     return False
 
 
 def send(req: dict, timeout: float = 605.0) -> dict:
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(timeout)
-    sock.connect(str(SOCK_PATH))
-    sock.sendall((json.dumps(req) + "\n").encode())
+    info = read_info()
+    if not info:
+        raise RuntimeError("daemon info file missing")
+    req = dict(req, auth=info["token"])
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    s.connect(("127.0.0.1", int(info["port"])))
+    s.sendall((json.dumps(req) + "\n").encode())
     buf = b""
     while not buf.endswith(b"\n"):
-        chunk = sock.recv(4096)
+        chunk = s.recv(4096)
         if not chunk:
             break
         buf += chunk
-    sock.close()
+    s.close()
     return json.loads(buf.decode().strip())
 
 
@@ -111,12 +135,8 @@ def cmd_notify(args):
 def cmd_ask(args):
     if not ensure_daemon(args):
         sys.exit(2)
-    req = {
-        "cmd": "ask",
-        "text": args.text,
-        "options": args.option or [],
-        "timeout": args.timeout,
-    }
+    req = {"cmd": "ask", "text": args.text,
+           "options": args.option or [], "timeout": args.timeout}
     try:
         resp = send(req, timeout=args.timeout + 15)
     except Exception as e:
@@ -125,7 +145,6 @@ def cmd_ask(args):
     if not resp.get("ok"):
         print(f"(no reply: {resp.get('error', 'unknown')})", file=sys.stderr)
         sys.exit(1)
-    # Print just the answer to stdout. The slash command consumes this.
     print(resp["answer"])
 
 

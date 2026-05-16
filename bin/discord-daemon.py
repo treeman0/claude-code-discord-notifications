@@ -3,18 +3,20 @@
 discord-daemon: long-running process that owns a Discord gateway WebSocket
 connection, sends DMs, and waits for replies from your phone.
 
-CLIs talk to it over a Unix domain socket. The daemon is started lazily by the
-hook on first use, then keeps running until you reboot or kill it explicitly.
+CLIs talk to it over a TCP loopback socket (127.0.0.1:<random_port>). The
+daemon writes its port + auth token to ~/.claude/discord-daemon.info on
+startup. The client reads that file, opens the connection, and proves identity
+by including the token in each request.
 
-Protocol over the Unix socket (one line of JSON per request/response):
-    {"cmd": "notify",  "text": "..."}                         -> {"ok": true}
-    {"cmd": "ask",     "text": "...", "options": [...], "timeout": 600}
-                                       -> {"ok": true, "answer": "yes"}
-                                       -> {"ok": false, "error": "timeout"}
-    {"cmd": "status"}                                          -> {"ok": true, ...}
-    {"cmd": "stop"}                                            -> {"ok": true}
+Protocol (one JSON object per line, newline-terminated):
+    request:  {"auth": "...", "cmd": "notify"|"ask"|"status"|"stop", ...}
+    response: {"ok": true|false, "answer": "...", "error": "...", ...}
 
-Requires: Python 3.8+, the `websockets` package (pip install --user websockets).
+Loopback + a per-startup token gives us cross-platform IPC (Windows-friendly,
+since AF_UNIX isn't reliable on Python/Windows), local-only access (bind is
+127.0.0.1), and proof that we reached our own daemon.
+
+Requires: Python 3.8+, the `websockets` package.
 """
 
 import asyncio
@@ -46,34 +48,35 @@ except ImportError:
 HOME = Path.home()
 CLAUDE_DIR = HOME / ".claude"
 ENV_FILE = Path(os.environ.get("CC_DISCORD_ENV_FILE", CLAUDE_DIR / ".discord.env"))
-SOCK_PATH = Path(os.environ.get("CC_DISCORD_SOCK", CLAUDE_DIR / "discord-daemon.sock"))
+INFO_FILE = Path(os.environ.get("CC_DISCORD_INFO", CLAUDE_DIR / "discord-daemon.info"))
 PID_FILE = CLAUDE_DIR / "discord-daemon.pid"
 LOG_FILE = CLAUDE_DIR / "discord-daemon.log"
 
 GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json"
 API_BASE = "https://discord.com/api/v10"
-DM_CHANNEL_CACHE: dict = {}  # user_id -> dm_channel_id
+DM_CHANNEL_CACHE: dict = {}
 
-# Intents bitfield: DIRECT_MESSAGES (1<<12). That's all we need — DM message
-# content is delivered to bots without MESSAGE_CONTENT, and button clicks come
-# as INTERACTION_CREATE which doesn't need any intent.
+# Intents: DIRECT_MESSAGES (1<<12). DM message content arrives without
+# MESSAGE_CONTENT, and button clicks arrive as INTERACTION_CREATE which needs
+# no intent at all.
 INTENTS = 1 << 12
 
+CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()],
+    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"),
+              logging.StreamHandler()],
 )
 log = logging.getLogger("discord-daemon")
 
 
 def load_env() -> dict:
-    """Parse a simple KEY=VALUE env file. Strips quotes."""
     if not ENV_FILE.exists():
         log.error("no env file at %s", ENV_FILE)
         sys.exit(2)
     out = {}
-    for line in ENV_FILE.read_text().splitlines():
+    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -83,10 +86,9 @@ def load_env() -> dict:
     return out
 
 
-# ---- REST helpers ------------------------------------------------------------
+# ---- REST helpers -----------------------------------------------------------
 
 def _api(method: str, path: str, token: str, body: Optional[dict] = None) -> dict:
-    """Tiny REST client. Returns parsed JSON dict, or {} on 204."""
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
         f"{API_BASE}{path}",
@@ -111,7 +113,6 @@ def _api(method: str, path: str, token: str, body: Optional[dict] = None) -> dic
 
 
 def open_dm(token: str, user_id: str) -> str:
-    """Get (or create) the DM channel ID for a user."""
     if user_id in DM_CHANNEL_CACHE:
         return DM_CHANNEL_CACHE[user_id]
     ch = _api("POST", "/users/@me/channels", token, {"recipient_id": user_id})
@@ -121,7 +122,6 @@ def open_dm(token: str, user_id: str) -> str:
 
 def send_message(token: str, channel_id: str, content: str,
                  components: Optional[list] = None) -> dict:
-    """POST a message to a channel, optionally with action-row components."""
     body = {"content": content}
     if components:
         body["components"] = components
@@ -130,10 +130,7 @@ def send_message(token: str, channel_id: str, content: str,
 
 def ack_interaction(interaction_id: str, interaction_token: str,
                     edited_content: str) -> None:
-    """ACK a button click by editing the original message to remove the buttons
-    and show the chosen answer. Must respond within 3 seconds.
-
-    Type 7 = UPDATE_MESSAGE (replaces the original message)."""
+    """ACK a button click. Type 7 = UPDATE_MESSAGE — edits the original message."""
     url = f"{API_BASE}/interactions/{interaction_id}/{interaction_token}/callback"
     body = {"type": 7, "data": {"content": edited_content, "components": []}}
     req = urllib.request.Request(
@@ -147,38 +144,33 @@ def ack_interaction(interaction_id: str, interaction_token: str,
         log.warning("interaction ack failed: %s", e)
 
 
-# ---- Pending question registry ----------------------------------------------
+# ---- Pending question registry ---------------------------------------------
 
 class Pending:
-    """Tracks open questions awaiting an answer."""
-
     def __init__(self):
-        self._by_id: dict = {}      # request_id -> entry
-        self._by_msg: dict = {}     # discord message_id -> request_id
+        self._by_id: dict = {}
+        self._by_msg: dict = {}
 
-    def add(self, request_id: str, message_id: str, future, options):
+    def add(self, request_id, message_id, future, options):
         self._by_id[request_id] = {
-            "message_id": message_id,
-            "future": future,
-            "options": options,
-            "created": time.time(),
+            "message_id": message_id, "future": future,
+            "options": options, "created": time.time(),
         }
         self._by_msg[message_id] = request_id
 
-    def resolve_by_message(self, message_id: str, answer: str) -> bool:
+    def resolve_by_message(self, message_id, answer) -> bool:
         req_id = self._by_msg.get(message_id)
         if not req_id:
             return False
         return self._resolve(req_id, answer)
 
-    def resolve_oldest(self, answer: str) -> bool:
-        """Free-text reply matches the oldest open question."""
+    def resolve_oldest(self, answer) -> bool:
         if not self._by_id:
             return False
         req_id = min(self._by_id, key=lambda k: self._by_id[k]["created"])
         return self._resolve(req_id, answer)
 
-    def _resolve(self, req_id: str, answer: str) -> bool:
+    def _resolve(self, req_id, answer) -> bool:
         entry = self._by_id.pop(req_id, None)
         if not entry:
             return False
@@ -188,8 +180,8 @@ class Pending:
             fut.get_loop().call_soon_threadsafe(fut.set_result, {"answer": answer})
         return True
 
-    def cancel(self, request_id: str):
-        entry = self._by_id.pop(request_id, None)
+    def cancel(self, req_id):
+        entry = self._by_id.pop(req_id, None)
         if entry:
             self._by_msg.pop(entry["message_id"], None)
 
@@ -197,7 +189,7 @@ class Pending:
         return len(self._by_id)
 
 
-# ---- Daemon state -----------------------------------------------------------
+# ---- Daemon state ----------------------------------------------------------
 
 class Daemon:
     def __init__(self, env: dict):
@@ -212,7 +204,6 @@ class Daemon:
         self.started_at = time.time()
 
     async def run_gateway(self):
-        """Main gateway loop. Reconnects forever on disconnects."""
         backoff = 1
         while True:
             url = self.resume_url or GATEWAY_URL
@@ -235,11 +226,9 @@ class Daemon:
             raise RuntimeError(f"expected Hello, got op={hello.get('op')}")
         hb_ms = hello["d"]["heartbeat_interval"]
         log.info("hello received, hb=%dms", hb_ms)
-
         hb_task = asyncio.create_task(self._heartbeat_loop(ws, hb_ms))
 
         if self.session_id and self.seq is not None:
-            log.info("attempting resume seq=%d", self.seq)
             await ws.send(json.dumps({
                 "op": 6,
                 "d": {"token": self.token, "session_id": self.session_id, "seq": self.seq},
@@ -248,8 +237,7 @@ class Daemon:
             await ws.send(json.dumps({
                 "op": 2,
                 "d": {
-                    "token": self.token,
-                    "intents": INTENTS,
+                    "token": self.token, "intents": INTENTS,
                     "properties": {"os": sys.platform, "browser": "cc-discord",
                                    "device": "cc-discord"},
                 },
@@ -257,8 +245,7 @@ class Daemon:
 
         try:
             async for msg in ws:
-                payload = json.loads(msg)
-                await self._handle_event(payload)
+                await self._handle_event(json.loads(msg))
         finally:
             hb_task.cancel()
 
@@ -282,7 +269,7 @@ class Daemon:
             if t == "READY":
                 self.session_id = d.get("session_id")
                 self.resume_url = d.get("resume_gateway_url")
-                log.info("READY: logged in as %s", d.get("user", {}).get("username"))
+                log.info("READY: logged in as %s", (d.get("user") or {}).get("username"))
                 self.ready_event.set()
             elif t == "RESUMED":
                 log.info("session resumed")
@@ -303,10 +290,9 @@ class Daemon:
             await asyncio.sleep(2)
             await self.ws.close(code=4000)
         elif op == 11:
-            pass  # Heartbeat ACK
+            pass
 
     async def _on_message(self, d: dict):
-        """A DM was sent to the bot. Try to match it to an open question."""
         author = d.get("author") or {}
         if author.get("bot"):
             return
@@ -320,8 +306,7 @@ class Daemon:
             log.info("(no pending question to match this reply to)")
 
     async def _on_interaction(self, d: dict):
-        """A button was clicked."""
-        if d.get("type") != 3:  # MESSAGE_COMPONENT
+        if d.get("type") != 3:
             return
         user_obj = d.get("user") or (d.get("member") or {}).get("user") or {}
         if user_obj.get("id") != self.user_id:
@@ -345,7 +330,6 @@ class Daemon:
     async def do_ask(self, text: str, options: list, timeout: float) -> dict:
         await self._wait_ready(timeout=10)
         channel = await asyncio.to_thread(open_dm, self.token, self.user_id)
-
         components = self._build_components(options) if options else None
         msg = await asyncio.to_thread(send_message, self.token, channel, text, components)
         message_id = msg["id"]
@@ -365,23 +349,17 @@ class Daemon:
 
     @staticmethod
     def _build_components(options: list) -> list:
-        """Discord action rows: up to 5 buttons per row, max 5 rows = 25 options."""
         options = options[:25]
         rows = []
         for i in range(0, len(options), 5):
             chunk = options[i:i+5]
-            row = {
-                "type": 1,  # ACTION_ROW
-                "components": [
-                    {
-                        "type": 2,        # BUTTON
-                        "style": 2,       # SECONDARY (gray)
-                        "label": opt[:80],
-                        "custom_id": f"ans:{opt}"[:100],
-                    } for opt in chunk
-                ],
-            }
-            rows.append(row)
+            rows.append({
+                "type": 1,
+                "components": [{
+                    "type": 2, "style": 2,
+                    "label": opt[:80], "custom_id": f"ans:{opt}"[:100],
+                } for opt in chunk],
+            })
         return rows
 
     async def _wait_ready(self, timeout: float):
@@ -391,22 +369,26 @@ class Daemon:
             raise RuntimeError("daemon not ready — gateway connection not established yet")
 
 
-# ---- Unix socket server -----------------------------------------------------
+# ---- TCP loopback server ---------------------------------------------------
 
-async def serve_socket(daemon: Daemon, stop_event: asyncio.Event):
-    if SOCK_PATH.exists():
-        SOCK_PATH.unlink()
-    SOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+async def serve_tcp(daemon: Daemon, auth_token: str, stop_event: asyncio.Event):
+    INFO_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     async def handle(reader, writer):
         try:
-            line = await reader.readline()
+            line = await asyncio.wait_for(reader.readline(), timeout=300)
             if not line:
                 return
             try:
                 req = json.loads(line)
             except Exception as e:
                 writer.write(json.dumps({"ok": False, "error": f"bad json: {e}"}).encode() + b"\n")
+                await writer.drain()
+                return
+
+            given = req.get("auth", "")
+            if not secrets.compare_digest(given, auth_token):
+                writer.write(json.dumps({"ok": False, "error": "auth"}).encode() + b"\n")
                 await writer.drain()
                 return
 
@@ -449,9 +431,20 @@ async def serve_socket(daemon: Daemon, stop_event: asyncio.Event):
             except Exception:
                 pass
 
-    server = await asyncio.start_unix_server(handle, path=str(SOCK_PATH))
-    os.chmod(SOCK_PATH, 0o600)
-    log.info("listening on %s", SOCK_PATH)
+    # Bind 127.0.0.1, kernel-chosen port.
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+
+    info_payload = json.dumps({
+        "port": port, "token": auth_token, "pid": os.getpid(),
+        "started_at": daemon.started_at, "version": 1,
+    })
+    INFO_FILE.write_text(info_payload, encoding="utf-8")
+    try:
+        os.chmod(INFO_FILE, 0o600)
+    except Exception:
+        pass  # Windows: chmod is a noop; OK
+    log.info("listening on 127.0.0.1:%d (info=%s)", port, INFO_FILE)
 
     async with server:
         await stop_event.wait()
@@ -466,10 +459,12 @@ def write_pid():
 
 
 def cleanup():
-    for p in (SOCK_PATH, PID_FILE):
+    for p in (INFO_FILE, PID_FILE):
         try:
             p.unlink()
         except FileNotFoundError:
+            pass
+        except Exception:
             pass
 
 
@@ -482,23 +477,24 @@ async def main():
     write_pid()
     daemon = Daemon(env)
     stop_event = asyncio.Event()
+    auth_token = secrets.token_urlsafe(24)
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, stop_event.set)
-        except NotImplementedError:
+        except (NotImplementedError, ValueError):
             pass  # Windows
 
     gateway_task = asyncio.create_task(daemon.run_gateway())
-    socket_task = asyncio.create_task(serve_socket(daemon, stop_event))
+    server_task = asyncio.create_task(serve_tcp(daemon, auth_token, stop_event))
 
     try:
         await stop_event.wait()
     finally:
         gateway_task.cancel()
-        socket_task.cancel()
-        for t in (gateway_task, socket_task):
+        server_task.cancel()
+        for t in (gateway_task, server_task):
             try:
                 await t
             except (asyncio.CancelledError, Exception):
