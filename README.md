@@ -16,7 +16,7 @@ Cross-platform: macOS, Linux, and Windows (Git Bash / MSYS / native).
 Inside Claude Code:
 
 ```
-/plugin marketplace add treeman0/claude-code-discord-notifications
+/plugin marketplace add treeman0/claude-code-marketplace
 /plugin install claude-code-discord-notifications@treeman0
 /discord-setup
 ```
@@ -84,7 +84,7 @@ The daemon writes a PID file at `~/.claude/discord-daemon.pid`, the info file at
 - **Python 3.8+** on PATH as `python3`.
   - macOS / most Linux distros: already present.
   - Windows: install python.org Python (or use the one MSYS provides if it has pip). See **Windows notes** below.
-- **`websockets`** package — `/discord-setup` installs it via `pip install --user`.
+- **`websockets`** and **`certifi`** packages — `/discord-setup` installs them via `pip install --user`. `certifi` is required on Windows because Python doesn't trust the OS cert store by default.
 - A **Discord account** and a **server you can invite the bot to** (a private server-of-one works fine).
 
 ### Windows notes
@@ -141,7 +141,6 @@ Stop the daemon: `python3 ~/.claude/plugins/cache/claude-code-discord-notificati
 
 ```
 .claude-plugin/
-  marketplace.json     marketplace catalog
   plugin.json          plugin manifest
 hooks/
   hooks.json           hook registrations (auto-applied)
