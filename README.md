@@ -1,15 +1,33 @@
 # claude-code-discord-notifications
 
-A Claude Code plugin that DMs you on **Discord** when Claude:
+A Claude Code plugin that makes Discord a **remote co-pilot** for Claude Code. Claude DMs you on Discord when it:
 
-- ✅ **finishes** a turn
+- ✅ **finishes** a turn (with a summary of tools used)
 - ❓ **asks a question** or goes idle waiting
-- 🔐 **wants permission** to run a tool
+- 🔐 **wants to run a tool** that isn't on the auto-allow list — you tap `✅ Approve` or `❌ Deny` on your phone, Claude proceeds or stops accordingly
 - 🛑 **hits an API error** (rate limit, auth, billing, server, max output tokens)
 
-And, optionally — the part you actually came for — **Claude can ask you a question on Discord and wait for your reply, with tappable buttons**. You tap an option on your phone (or type a free-form answer), Claude reads it back, conversation continues.
+Plus: **round-trip questions** — Claude can ask you a question on Discord with tappable buttons (or free-form text), and wait for your answer. Run `/ask-discord` yourself, or tell Claude (in `CLAUDE.md`) to use it when you might be away from the keyboard.
 
 Cross-platform: macOS, Linux, and Windows (Git Bash / MSYS / native).
+
+## How tool approval works
+
+The plugin registers a `PreToolUse` hook. Before Claude can run anything that modifies state, the hook checks an auto-allow list:
+
+- **Auto-allowed (no DM):** `Read`, `Glob`, `Grep`, `TodoWrite`, `WebFetch`, `WebSearch`, `NotebookRead`, plus safe Bash commands (`ls`, `cat`, `git status/log/diff/branch`, `npm test`, `pytest`, `cargo test`, `*--version`, etc.). The Bash list rejects anything with `>`, `<`, `|`, `&`, `;`, `$(...)`, backticks, or `&&`/`||` — even if the leading command is safe.
+- **Everything else:** DMed to you with two buttons. Default 60-second window for you to answer. Approve → Claude proceeds. Deny → Claude stops with the reason "Denied on Discord."
+- **If Discord is unreachable** (daemon down, phone offline, no answer within the timeout): falls back to Claude Code's normal in-terminal prompt. No silent allows.
+
+Configure via env vars in `~/.claude/.discord.env`:
+
+```
+CC_DISCORD_PERMISSION=off              # disable; behave like the base notification plugin
+CC_DISCORD_PERMISSION_TIMEOUT=120      # seconds to wait for Discord reply
+CC_DISCORD_PERMISSION_SKIP=Read,Glob   # override the auto-allow tool list
+CC_DISCORD_PERMISSION_BASH_SAFE=...    # override the safe-Bash regex
+CC_DISCORD_TICKER=off                  # disable the per-turn tool-use summary in Stop DMs
+```
 
 ## Install
 
@@ -144,7 +162,9 @@ Stop the daemon: `python3 ~/.claude/plugins/cache/claude-code-discord-notificati
   plugin.json          plugin manifest
 hooks/
   hooks.json           hook registrations (auto-applied)
-  notify.py            fires on Stop/Notification/StopFailure
+  permission.py        PreToolUse — Discord approval for risky tools
+  posttool.py          PostToolUse — accumulates per-turn tool summary
+  notify.py            Stop / Notification / StopFailure — DMs the user
 commands/
   discord-setup.md     /discord-setup wizard
   ask-discord.md       /ask-discord round-trip question

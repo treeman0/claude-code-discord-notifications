@@ -24,6 +24,62 @@ def safe_exit():
     sys.exit(0)
 
 
+def read_activity_summary(session_id: str, max_lines: int = 200) -> str:
+    """Read the per-session activity log and return a compact summary.
+
+    Each line is `timestamp\\ttool_name\\tsummary`. We:
+      - Count each tool name and show top-level counts ("3x Bash, 2x Edit")
+      - List the first few detail summaries beneath
+    """
+    log_path = Path.home() / ".claude" / "cc-discord" / f"activity-{session_id}.log"
+    if not log_path.exists():
+        return ""
+    try:
+        lines = log_path.read_text(encoding="utf-8").splitlines()[-max_lines:]
+    except Exception:
+        return ""
+    if not lines:
+        return ""
+
+    counts: dict = {}
+    details: list = []
+    for line in lines:
+        parts = line.split("\t", 2)
+        if len(parts) < 2:
+            continue
+        tool = parts[1]
+        summary = parts[2] if len(parts) > 2 else tool
+        counts[tool] = counts.get(tool, 0) + 1
+        details.append(summary)
+
+    if not counts:
+        return ""
+
+    # Sort tools by count desc, name asc for ties.
+    rollup_parts = []
+    for tool, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        rollup_parts.append(f"{n}x {tool}")
+    rollup = ", ".join(rollup_parts)
+
+    # Show up to 8 details from the back end of the turn (most recent
+    # actions are typically the most useful at-a-glance summary).
+    detail_lines = []
+    for d in details[-8:]:
+        d = d.strip()
+        if not d:
+            continue
+        # Trim duplicates ("Bash" by itself can be redundant alongside "Bash: cmd")
+        # but keep paths.
+        if len(d) > 100:
+            d = d[:97] + "…"
+        detail_lines.append(f"• {d}")
+
+    text = rollup
+    if detail_lines:
+        text += "\n" + "\n".join(detail_lines)
+    return text
+
+
 def main():
     home = Path.home()
     claude_dir = home / ".claude"
@@ -66,6 +122,10 @@ def main():
     msg = payload.get("message") or ""
     notif_type = payload.get("notification_type") or ""
     stopfail_reason = payload.get("reason") or ""
+    session_id = payload.get("session_id") or ""
+    # stop_hook_active = true means we're being re-invoked from a previous Stop
+    # hook's "continue" decision. Don't re-summarize tools in that case.
+    stop_hook_active = bool(payload.get("stop_hook_active"))
 
     # Build title + body per event type.
     title = ""
@@ -73,6 +133,17 @@ def main():
     if event == "Stop":
         title = "✅ Claude Code finished"
         body = "The agent finished its turn and is idle."
+        if not stop_hook_active and session_id:
+            summary = read_activity_summary(session_id)
+            if summary:
+                body += f"\n\n**Tools used this turn:**\n{summary}"
+            # Truncate or delete the file so next turn starts clean.
+            try:
+                log_path = Path.home() / ".claude" / "cc-discord" / f"activity-{session_id}.log"
+                if log_path.exists():
+                    log_path.unlink()
+            except Exception:
+                pass
     elif event == "Notification":
         if notif_type == "permission_prompt":
             title = "🔐 Claude Code wants permission"
