@@ -83,6 +83,7 @@ ENV_FILE = Path(os.environ.get("CC_DISCORD_ENV_FILE", CLAUDE_DIR / ".discord.env
 INFO_FILE = Path(os.environ.get("CC_DISCORD_INFO", CLAUDE_DIR / "discord-daemon.info"))
 PID_FILE = CLAUDE_DIR / "discord-daemon.pid"
 LOG_FILE = CLAUDE_DIR / "discord-daemon.log"
+INBOX_FILE = CLAUDE_DIR / "cc-discord" / "inbox.jsonl"
 
 GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json"
 API_BASE = "https://discord.com/api/v10"
@@ -458,7 +459,35 @@ class Daemon:
         entry = self.pending.get_oldest_entry()
 
         if not self.pending.resolve_oldest(content):
-            log.info("(no pending question to match this reply to)")
+            # No pending question — treat the DM as a queued command for
+            # Claude Code's next user prompt. The UserPromptSubmit hook
+            # (hooks/inbox.py) drains this file on the next prompt and
+            # injects the items as additionalContext.
+            try:
+                INBOX_FILE.parent.mkdir(parents=True, exist_ok=True)
+                with INBOX_FILE.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(
+                        {"ts": time.time(), "content": content}
+                    ) + "\n")
+                log.info("queued DM to inbox (%d chars)", len(content))
+                # Best-effort ack reaction would be nice, but adding a
+                # reaction requires READ_MESSAGE_HISTORY + READ_REACTIONS
+                # intents we don't currently request. Acknowledge inline
+                # so the user sees their message landed.
+                try:
+                    channel_id = d.get("channel_id")
+                    if channel_id:
+                        ack = (
+                            "📥 Queued for Claude Code "
+                            f"(will be picked up on your next prompt)."
+                        )
+                        await asyncio.to_thread(
+                            send_message, self.token, channel_id, ack,
+                        )
+                except Exception as e:
+                    log.warning("inbox ack send failed: %s", e)
+            except Exception as e:
+                log.warning("inbox write failed: %s", e)
             return
 
         # Edit the original DM message to show the answer + drop buttons,

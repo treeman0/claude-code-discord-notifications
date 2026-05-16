@@ -219,29 +219,70 @@ def truncate(s: str, n: int = 180) -> str:
     return s[:n - 1] + "…"
 
 
+def _short_path(p: str, max_len: int = 60) -> str:
+    """Shorten a long path to `…/parent/leaf` for readability in DMs."""
+    if not p or len(p) <= max_len:
+        return p
+    try:
+        pp = Path(p)
+        if pp.parent.name:
+            return f"…/{pp.parent.name}/{pp.name}"
+        return pp.name
+    except Exception:
+        return p
+
+
+def _short_cwd(cwd: str) -> str:
+    """Return `parent/leaf` for a cwd, dropping the long absolute prefix."""
+    if not cwd:
+        return ""
+    try:
+        p = Path(cwd)
+        if p.parent.name:
+            return f"{p.parent.name}/{p.name}"
+        return p.name
+    except Exception:
+        return cwd
+
+
 def build_prompt(tool_name: str, tool_input: dict, cwd: str) -> str:
-    """Compose a short Discord prompt summarizing the tool call."""
-    # Tool-specific summaries make the DM scannable.
+    """Compose a short Discord prompt summarizing the tool call.
+
+    Layout (approve/deny buttons render below the body):
+        <emoji> **<tool>**
+        _<optional description>_
+        <code block of the command, path, or input>
+        📂 `<short-cwd>`
+    """
+    header = ""
+    desc = ""
+    body = ""
+
     if tool_name == "Bash":
         cmd = truncate(tool_input.get("command", ""), 400)
         desc = truncate(tool_input.get("description", ""), 120)
-        body = f"`{cmd}`"
-        if desc:
-            body += f"\n_{desc}_"
+        header = "🔐 **Bash**"
+        body = f"```bash\n{cmd}\n```"
     elif tool_name in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
         path = tool_input.get("file_path") or tool_input.get("notebook_path") or "(unknown path)"
-        body = f"📝 `{tool_name}` → `{path}`"
+        header = f"📝 **{tool_name}**"
+        body = f"`{_short_path(path)}`"
     elif tool_name.startswith("mcp__"):
         # Show just the MCP server + tool name; inputs can be huge.
-        body = f"🔌 `{tool_name}`"
+        header = f"🔌 **{tool_name}**"
     else:
-        # Fall back to truncated repr of the input.
-        body = f"`{tool_name}`\n`{truncate(json.dumps(tool_input, separators=(',', ':')), 300)}`"
+        header = f"🛠 **{tool_name}**"
+        body = f"```json\n{truncate(json.dumps(tool_input, separators=(',', ':')), 300)}\n```"
 
-    text = f"**🔐 Tool approval requested: `{tool_name}`**\n{body}"
-    if cwd:
-        text += f"\n_{cwd}_"
-    return text
+    parts = [header]
+    if desc:
+        parts.append(f"_{desc}_")
+    if body:
+        parts.append(body)
+    short_cwd = _short_cwd(cwd)
+    if short_cwd:
+        parts.append(f"📂 `{short_cwd}`")
+    return "\n".join(parts)
 
 
 def ask_discord(text: str, options: list, timeout: float,
@@ -302,9 +343,10 @@ def handle_ask_user_question(tool_input: dict, cwd: str,
     # Pre-flight intro DM so the user knows what's coming if there are
     # multiple questions. Skip for the single-question case (less noise).
     if len(questions) > 1:
-        intro = f"**❓ Claude needs you to answer {len(questions)} question(s)**"
-        if cwd:
-            intro += f"\n_{cwd}_"
+        intro = f"❓ **Claude needs you to answer {len(questions)} questions**"
+        short_cwd = _short_cwd(cwd)
+        if short_cwd:
+            intro += f"\n📂 `{short_cwd}`"
         for i, q in enumerate(questions, 1):
             qtext = (q.get("question") or "").strip()
             intro += f"\n\n**{i}.** {truncate(qtext, 140)}"
