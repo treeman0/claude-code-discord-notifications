@@ -166,9 +166,83 @@ def send_message(token: str, channel_id: str, content: str,
     return _api("POST", f"/channels/{channel_id}/messages", token, body)
 
 
+def edit_message(token: str, channel_id: str, message_id: str,
+                 content: str, remove_components: bool = True) -> None:
+    """Edit a previously-sent message; optionally strip its components.
+
+    Used to clean up DM ask messages when the answer arrived elsewhere
+    (terminal prompt, timeout). Removing components prevents the user from
+    tapping a stale button and getting an 'interaction failed' error.
+
+    Best-effort. Logs and continues on failure.
+    """
+    body = {"content": content}
+    if remove_components:
+        body["components"] = []
+    try:
+        _api("PATCH", f"/channels/{channel_id}/messages/{message_id}", token, body)
+    except Exception as e:
+        log.warning("edit_message failed for msg %s: %s", message_id, e)
+
+
+def ack_interaction_deferred(interaction_id: str, interaction_token: str) -> None:
+    """Immediately ACK a button click with type 6 (DEFERRED_UPDATE_MESSAGE).
+
+    This is the critical path. Discord gives us 3 seconds from the moment the
+    user taps the button to acknowledge the interaction, or it shows "This
+    interaction failed" to the user. type 6 just says "I got it, the UI will
+    update in a moment" and is almost always sub-100ms. We then do the actual
+    content edit in a separate PATCH below — that has a 15-minute window.
+    """
+    url = f"{API_BASE}/interactions/{interaction_id}/{interaction_token}/callback"
+    body = {"type": 6}  # DEFERRED_UPDATE_MESSAGE
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode(), method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        if req.full_url.startswith("https://"):
+            with urllib.request.urlopen(req, timeout=3, context=SSL_CONTEXT) as r:
+                r.read()
+        else:
+            with urllib.request.urlopen(req, timeout=3) as r:
+                r.read()
+    except Exception as e:
+        log.warning("interaction ack failed: %s", e)
+
+
+def edit_original_interaction_response(application_id: str, interaction_token: str,
+                                       new_content: str) -> None:
+    """Edit the original message after a deferred ACK.
+
+    Uses the interaction webhook PATCH endpoint. Token is valid 15 minutes.
+    No 3-second deadline; safe to do at any pace.
+    """
+    url = f"{API_BASE}/webhooks/{application_id}/{interaction_token}/messages/@original"
+    body = {"content": new_content, "components": []}
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode(), method="PATCH",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        if req.full_url.startswith("https://"):
+            with urllib.request.urlopen(req, timeout=10, context=SSL_CONTEXT) as r:
+                r.read()
+        else:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                r.read()
+    except Exception as e:
+        log.warning("interaction edit failed: %s", e)
+
+
 def ack_interaction(interaction_id: str, interaction_token: str,
                     edited_content: str) -> None:
-    """ACK a button click. Type 7 = UPDATE_MESSAGE — edits the original message."""
+    """Legacy single-shot ACK (type 7 UPDATE_MESSAGE). Kept for compatibility.
+
+    Prefer ack_interaction_deferred + edit_original_interaction_response for
+    button presses, since the combined version is at risk of breaching the
+    3-second interaction deadline.
+    """
     url = f"{API_BASE}/interactions/{interaction_id}/{interaction_token}/callback"
     body = {"type": 7, "data": {"content": edited_content, "components": []}}
     req = urllib.request.Request(
@@ -193,10 +267,13 @@ class Pending:
         self._by_id: dict = {}
         self._by_msg: dict = {}
 
-    def add(self, request_id, message_id, future, options):
+    def add(self, request_id, message_id, future, options,
+            channel_id=None, original_text=None):
         self._by_id[request_id] = {
             "message_id": message_id, "future": future,
             "options": options, "created": time.time(),
+            "channel_id": channel_id,
+            "original_text": original_text,
         }
         self._by_msg[message_id] = request_id
 
@@ -212,6 +289,19 @@ class Pending:
         req_id = min(self._by_id, key=lambda k: self._by_id[k]["created"])
         return self._resolve(req_id, answer)
 
+    def get_entry(self, message_id):
+        """Return the pending entry for a message_id without resolving it."""
+        req_id = self._by_msg.get(message_id)
+        if not req_id:
+            return None
+        return self._by_id.get(req_id)
+
+    def get_oldest_entry(self):
+        if not self._by_id:
+            return None
+        req_id = min(self._by_id, key=lambda k: self._by_id[k]["created"])
+        return self._by_id.get(req_id)
+
     def _resolve(self, req_id, answer) -> bool:
         entry = self._by_id.pop(req_id, None)
         if not entry:
@@ -223,9 +313,12 @@ class Pending:
         return True
 
     def cancel(self, req_id):
+        """Remove a pending entry without resolving its future."""
         entry = self._by_id.pop(req_id, None)
         if entry:
             self._by_msg.pop(entry["message_id"], None)
+            return entry
+        return None
 
     def count(self) -> int:
         return len(self._by_id)
@@ -237,6 +330,7 @@ class Daemon:
     def __init__(self, env: dict):
         self.token = env["DISCORD_BOT_TOKEN"]
         self.user_id = env["DISCORD_USER_ID"]
+        self.bot_user_id = ""  # set from READY event; used as application_id
         self.pending = Pending()
         self.ws = None
         self.seq = None
@@ -314,6 +408,9 @@ class Daemon:
             if t == "READY":
                 self.session_id = d.get("session_id")
                 self.resume_url = d.get("resume_gateway_url")
+                # Capture the bot's own user ID — same as application ID for
+                # interaction webhook URLs.
+                self.bot_user_id = (d.get("user") or {}).get("id", "")
                 log.info("READY: logged in as %s", (d.get("user") or {}).get("username"))
                 self.ready_event.set()
             elif t == "RESUMED":
@@ -347,8 +444,25 @@ class Daemon:
         if not content:
             return
         log.info("DM reply received: %r", content[:80])
+
+        # Grab the oldest pending entry (the one this reply will resolve)
+        # BEFORE resolving, so we still have its message_id/channel_id.
+        entry = self.pending.get_oldest_entry()
+
         if not self.pending.resolve_oldest(content):
             log.info("(no pending question to match this reply to)")
+            return
+
+        # Edit the original DM message to show the answer + drop buttons,
+        # so it doesn't sit there with live buttons that go nowhere.
+        if entry and entry.get("channel_id") and entry.get("message_id"):
+            original = entry.get("original_text") or "(question)"
+            new_text = f"❓ ~~{original}~~\n💬 **Replied: {content[:200]}**"
+            asyncio.create_task(asyncio.to_thread(
+                edit_message, self.token,
+                entry["channel_id"], entry["message_id"],
+                new_text, True,
+            ))
 
     async def _on_interaction(self, d: dict):
         if d.get("type") != 3:
@@ -359,12 +473,42 @@ class Daemon:
         message_id = (d.get("message") or {}).get("id")
         custom_id = (d.get("data") or {}).get("custom_id", "")
         answer = custom_id.split(":", 1)[1] if custom_id.startswith("ans:") else custom_id
+        interaction_id = d["id"]
+        interaction_token = d["token"]
         log.info("button click for message %s: %r", message_id, answer)
-        edited = f"❓ ~~(answered)~~\n→ **{answer}**"
-        asyncio.create_task(asyncio.to_thread(
-            ack_interaction, d["id"], d["token"], edited
-        ))
+
+        # CRITICAL: ACK within 3 seconds, or Discord shows "interaction failed".
+        # We send the lightweight type-6 DEFERRED_UPDATE_MESSAGE here. This is
+        # almost always sub-100ms. Doing it synchronously (with await) means
+        # any future event handling waits behind it, but the ACK itself is so
+        # fast that this is the right tradeoff vs risking a missed deadline.
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(ack_interaction_deferred,
+                                  interaction_id, interaction_token),
+                timeout=2.5,  # below Discord's 3s deadline
+            )
+        except asyncio.TimeoutError:
+            log.warning("ack timed out, message may have shown 'interaction failed'")
+
+        # Resolve the pending future right away — Claude needs the answer.
+        # Capture the entry first so we still have original_text for the edit.
+        entry = self.pending.get_entry(message_id)
         self.pending.resolve_by_message(message_id, answer)
+
+        # Now edit the original message asynchronously (no time pressure).
+        # We use the interaction webhook PATCH endpoint, which is valid for
+        # 15 minutes regardless of how long the ACK took.
+        original = (entry or {}).get("original_text") or "(question)"
+        edited = f"❓ ~~{original}~~\n✅ **You tapped: {answer}**"
+        application_id = self.bot_user_id  # populated from READY event
+        if application_id:
+            asyncio.create_task(asyncio.to_thread(
+                edit_original_interaction_response,
+                application_id, interaction_token, edited,
+            ))
+        else:
+            log.warning("bot_user_id not set; skipping interaction edit")
 
     async def do_notify(self, text: str) -> dict:
         await self._wait_ready(timeout=10)
@@ -381,14 +525,30 @@ class Daemon:
 
         request_id = secrets.token_hex(8)
         future = asyncio.get_running_loop().create_future()
-        self.pending.add(request_id, message_id, future, options)
+        # Pass channel_id and original text so we can edit the message later
+        # (on timeout, or to show what was answered).
+        self.pending.add(request_id, message_id, future, options,
+                         channel_id=channel, original_text=text)
         log.info("ask: posted message %s, awaiting reply (timeout=%ss)", message_id, timeout)
 
         try:
             result = await asyncio.wait_for(future, timeout=timeout)
             return {"ok": True, "answer": result["answer"]}
         except asyncio.TimeoutError:
-            self.pending.cancel(request_id)
+            # Pull the entry without resolving the future so we still have
+            # channel_id/message_id for cleanup.
+            entry = self.pending.cancel(request_id)
+            if entry and entry.get("channel_id") and entry.get("message_id"):
+                original = entry.get("original_text") or "(question)"
+                new_text = (
+                    f"❓ ~~{original}~~\n"
+                    f"⏱️ **Timed out after {int(timeout)}s — answered elsewhere or no longer needed.**"
+                )
+                asyncio.create_task(asyncio.to_thread(
+                    edit_message, self.token,
+                    entry["channel_id"], entry["message_id"],
+                    new_text, True,
+                ))
             return {"ok": False, "error": "timeout",
                     "message": f"No reply received within {int(timeout)}s."}
 
