@@ -25,7 +25,7 @@ By the end of this conversation:
 
 Read `~/.claude/.discord.env`. If it exists, show what's there (mask the token: first 8 chars + `***` + last 4). Ask whether to reconfigure or just re-test. If just re-test, jump to step 6.
 
-## Step 2 — Verify Python and install websockets
+## Step 2 — Verify Python and install dependencies
 
 This is the most error-prone step on Windows. Be careful here:
 
@@ -35,12 +35,12 @@ First, check which python3 is on PATH:
 
 Then check if websockets imports: `python3 -c "import websockets; print(websockets.__version__)"`
 
-If it works, skip to step 3.
+Install BOTH `websockets` AND `certifi`:
+- `python3 -m pip install --user websockets certifi`
+- If that fails with `externally-managed-environment`: `python3 -m pip install --user --break-system-packages websockets certifi`
+- If `pip` is missing entirely (`No module named pip`) — that's the MSYS-Python-without-pip problem; see below.
 
-If it fails with `ModuleNotFoundError`, try installing:
-- `python3 -m pip install --user websockets`
-- If that fails with `externally-managed-environment`: `python3 -m pip install --user --break-system-packages websockets`
-- If `pip` is missing entirely (`No module named pip`) — that's the MSYS-Python-without-pip problem.
+**Why certifi too?** Python on Windows often can't verify Discord's TLS cert against the OS cert store, which breaks the gateway WebSocket with `CERTIFICATE_VERIFY_FAILED`. `certifi` ships the Mozilla CA bundle that the daemon falls back to.
 
 **The MSYS-Python problem (Windows):** if the user's `python3` is `/c/msys64/mingw64/bin/python3` and has no pip, the cleanest fix is to use the Windows Python installation (`py` launcher) and route `python3` to it:
 

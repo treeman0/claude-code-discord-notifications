@@ -43,6 +43,38 @@ except ImportError:
     sys.exit(2)
 
 
+# ---- SSL setup (Windows-friendly) -------------------------------------------
+# Python on Windows often doesn't trust system CA roots out of the box, which
+# breaks gateway TLS with CERTIFICATE_VERIFY_FAILED. Try, in order:
+#   1. SSL_CERT_FILE env var (if user set it explicitly)
+#   2. certifi.where() (if certifi is installed — the standard Python CA bundle)
+#   3. truststore (Python 3.10+ stdlib hook into the OS cert store, if available)
+#   4. default ssl context (works on macOS/Linux out of the box)
+import ssl
+def build_ssl_context():
+    # 1. Explicit override
+    cafile = os.environ.get("SSL_CERT_FILE")
+    if cafile and os.path.exists(cafile):
+        return ssl.create_default_context(cafile=cafile)
+    # 2. certifi (pip install certifi)
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        pass
+    # 3. truststore (Python 3.10+, hooks into OS cert store)
+    try:
+        import truststore
+        ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        return ctx
+    except ImportError:
+        pass
+    # 4. Default — works on macOS/Linux, may fail on Windows.
+    return ssl.create_default_context()
+
+SSL_CONTEXT = build_ssl_context()
+
+
 # ---- Config ------------------------------------------------------------------
 
 HOME = Path.home()
@@ -101,9 +133,15 @@ def _api(method: str, path: str, token: str, body: Optional[dict] = None) -> dic
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = resp.read()
-            return json.loads(raw) if raw else {}
+        # Only pass context for https URLs (tests use http://).
+        if req.full_url.startswith("https://"):
+            with urllib.request.urlopen(req, timeout=15, context=SSL_CONTEXT) as resp:
+                raw = resp.read()
+                return json.loads(raw) if raw else {}
+        else:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw = resp.read()
+                return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as e:
         try:
             err_body = e.read().decode()
@@ -138,8 +176,12 @@ def ack_interaction(interaction_id: str, interaction_token: str,
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=5) as r:
-            r.read()
+        if req.full_url.startswith("https://"):
+            with urllib.request.urlopen(req, timeout=5, context=SSL_CONTEXT) as r:
+                r.read()
+        else:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                r.read()
     except Exception as e:
         log.warning("interaction ack failed: %s", e)
 
@@ -209,7 +251,10 @@ class Daemon:
             url = self.resume_url or GATEWAY_URL
             log.info("connecting to gateway %s (resume=%s)", url, bool(self.resume_url))
             try:
-                async with websockets.connect(url, max_size=2**20) as ws:
+                connect_kwargs = {"max_size": 2**20}
+                if url.startswith("wss://"):
+                    connect_kwargs["ssl"] = SSL_CONTEXT
+                async with websockets.connect(url, **connect_kwargs) as ws:
                     self.ws = ws
                     backoff = 1
                     await self._gateway_session(ws)

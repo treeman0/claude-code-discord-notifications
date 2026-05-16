@@ -17,12 +17,33 @@ Last line of stdout is one of:
 Cross-platform: uses urllib (stdlib only).
 """
 import json
+import os
 import sys
+import ssl
 import urllib.request
 import urllib.error
 
 API_BASE = "https://discord.com/api/v10"
 UA = "ClaudeCodeDiscordNotifier (https://github.com/treeman0/claude-code-discord-notifications, 1.0)"
+
+
+def _build_ssl_context():
+    cafile = os.environ.get("SSL_CERT_FILE")
+    if cafile and os.path.exists(cafile):
+        return ssl.create_default_context(cafile=cafile)
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        pass
+    try:
+        import truststore
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    except ImportError:
+        pass
+    return ssl.create_default_context()
+
+SSL_CONTEXT = _build_ssl_context()
 
 
 def post(path: str, token: str, body: dict):
@@ -37,7 +58,7 @@ def post(path: str, token: str, body: dict):
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=15, context=SSL_CONTEXT) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
             try:
                 return resp.status, json.loads(raw) if raw else {}
