@@ -14,9 +14,34 @@ Always exits 0. Any failure is silent.
 """
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
+
+
+def _cancel_deferred(session_id: str):
+    """Best-effort: tell the daemon to cancel any pending idle DM for this
+    session. Any tool use counts as 'still active', so we no longer want the
+    30s-idle ping to fire."""
+    if not session_id:
+        return
+    here = Path(__file__).resolve().parent
+    plugin_root = here.parent
+    client = plugin_root / "bin" / "discord-client.py"
+    daemon = plugin_root / "bin" / "discord-daemon.py"
+    if not client.exists():
+        return
+    env = os.environ.copy()
+    env["CC_DISCORD_DAEMON"] = str(daemon)
+    try:
+        subprocess.run(
+            [sys.executable, str(client), "--no-start", "cancel-deferred",
+             "--key", session_id],
+            input="", capture_output=True, text=True, timeout=5, env=env,
+        )
+    except Exception:
+        pass
 
 
 def main():
@@ -34,6 +59,9 @@ def main():
     tool_name = payload.get("tool_name", "")
     tool_input = payload.get("tool_input") or {}
     session_id = payload.get("session_id") or "unknown"
+
+    # Any tool use means Claude is still working — cancel any pending idle DM.
+    _cancel_deferred(session_id)
 
     if not tool_name:
         sys.exit(0)

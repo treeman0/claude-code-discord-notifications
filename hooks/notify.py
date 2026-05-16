@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-cc-discord notification hook.
+cc-discord notification hook (idle-timer mode).
 
-Fires on Stop, Notification (permission_prompt|idle_prompt), and StopFailure.
-Reads Claude Code's hook JSON from stdin, builds a short message, sends it to
-the daemon over the Unix socket (or named pipe on Windows... see note below).
+Fires on Stop, Notification(permission_prompt|idle_prompt), and StopFailure.
+Instead of sending a DM immediately, schedules a deferred DM N seconds out
+(default 30, override with CC_DISCORD_IDLE_DELAY). PostToolUse and
+UserPromptSubmit hooks cancel the deferred DM if the user gets back to work
+inside the window, so you only get pinged when Claude is genuinely stuck/idle.
 
-Credentials live in ~/.claude/.discord.env — outside the plugin cache, so they
-survive plugin updates.
+The DM is keyed by session_id so multiple parallel Claude Code sessions don't
+clobber each other's pending notifications.
 
-Cross-platform: works on macOS, Linux, and Windows (Git Bash, MSYS, native).
-Always exits 0 so a notification hiccup never blocks Claude Code.
+Credentials live in ~/.claude/.discord.env. Always exits 0 so a notification
+hiccup never blocks Claude Code.
 """
 import json
 import os
@@ -19,19 +21,25 @@ import sys
 import time
 from pathlib import Path
 
+
 # Always exit 0 from this hook, no matter what. A notification problem must
 # never disrupt Claude Code itself.
 def safe_exit():
     sys.exit(0)
 
 
-def read_activity_summary(session_id: str, max_lines: int = 200) -> str:
-    """Read the per-session activity log and return a compact summary.
+def _short_cwd(cwd: str) -> str:
+    if not cwd:
+        return ""
+    try:
+        p = Path(cwd)
+        return f"{p.parent.name}/{p.name}" if p.parent.name else p.name
+    except Exception:
+        return cwd
 
-    Each line is `timestamp\\ttool_name\\tsummary`. We:
-      - Count each tool name and show top-level counts ("3x Bash, 2x Edit")
-      - List the first few detail summaries beneath
-    """
+
+def read_activity_summary(session_id: str, max_lines: int = 200) -> str:
+    """Read the per-session activity log and return a compact summary."""
     log_path = Path.home() / ".claude" / "cc-discord" / f"activity-{session_id}.log"
     if not log_path.exists():
         return ""
@@ -56,21 +64,16 @@ def read_activity_summary(session_id: str, max_lines: int = 200) -> str:
     if not counts:
         return ""
 
-    # Sort tools by count desc, name asc for ties.
     rollup_parts = []
     for tool, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
-        rollup_parts.append(f"{n}x {tool}")
+        rollup_parts.append(f"{n}× {tool}")
     rollup = ", ".join(rollup_parts)
 
-    # Show up to 8 details from the back end of the turn (most recent
-    # actions are typically the most useful at-a-glance summary).
     detail_lines = []
     for d in details[-8:]:
         d = d.strip()
         if not d:
             continue
-        # Trim duplicates ("Bash" by itself can be redundant alongside "Bash: cmd")
-        # but keep paths.
         if len(d) > 100:
             d = d[:97] + "…"
         detail_lines.append(f"• {d}")
@@ -81,12 +84,28 @@ def read_activity_summary(session_id: str, max_lines: int = 200) -> str:
     return text
 
 
+def _format_dm(reason: str, title: str, detail: str, cwd: str) -> str:
+    """Build a pretty Discord DM body. Discord supports Markdown."""
+    parts = [f"## {title}"]
+    if detail:
+        parts.append(detail.strip())
+    cwd_short = _short_cwd(cwd)
+    if cwd_short:
+        parts.append(f"📂 `{cwd_short}`")
+    parts.append("")  # blank line before link
+    parts.append("🔗 Pick up on mobile: <https://claude.ai/code>")
+    body = "\n".join(parts)
+    # Discord hard cap is 2000 chars; keep the whole DM well under.
+    if len(body) > 1800:
+        body = body[:1797] + "..."
+    return body
+
+
 def main():
     home = Path.home()
     claude_dir = home / ".claude"
     env_file = Path(os.environ.get("CC_DISCORD_ENV_FILE", claude_dir / ".discord.env"))
 
-    # First-run: drop a hint file the user will notice, then exit silently.
     if not env_file.exists():
         hint = claude_dir / "cc-discord.NEEDS_SETUP"
         if not hint.exists():
@@ -102,17 +121,14 @@ def main():
                 pass
         safe_exit()
 
-    # Configured: nuke the hint if it's still hanging around.
     try:
         (claude_dir / "cc-discord.NEEDS_SETUP").unlink(missing_ok=True)
     except Exception:
         pass
 
-    # Read payload from stdin.
     raw = sys.stdin.read() if not sys.stdin.isatty() else ""
     if not raw.strip():
         safe_exit()
-
     try:
         payload = json.loads(raw)
     except Exception:
@@ -124,21 +140,21 @@ def main():
     notif_type = payload.get("notification_type") or ""
     stopfail_reason = payload.get("reason") or ""
     session_id = payload.get("session_id") or ""
-    # stop_hook_active = true means we're being re-invoked from a previous Stop
-    # hook's "continue" decision. Don't re-summarize tools in that case.
     stop_hook_active = bool(payload.get("stop_hook_active"))
 
-    # Build title + body per event type.
+    # Key the deferred notification by session_id so independent sessions don't
+    # clobber each other. Fall back to "default" if no session_id present.
+    key = session_id or "default"
+
     title = ""
-    body = ""
+    detail = ""
     if event == "Stop":
-        title = "✅ Claude Code finished"
-        body = "The agent finished its turn and is idle."
+        title = "✅ Claude Code finished its turn"
+        detail = "Agent went idle after completing the task."
         if not stop_hook_active and session_id:
             summary = read_activity_summary(session_id)
             if summary:
-                body += f"\n\n**Tools used this turn:**\n{summary}"
-            # Truncate or delete the file so next turn starts clean.
+                detail += f"\n\n**Tools used:**\n{summary}"
             try:
                 log_path = Path.home() / ".claude" / "cc-discord" / f"activity-{session_id}.log"
                 if log_path.exists():
@@ -146,123 +162,67 @@ def main():
             except Exception:
                 pass
     elif event == "Notification":
-        if notif_type == "permission_prompt":
-            # In "parallel" mode (default) the PreToolUse hook returns
-            # "ask" immediately so the terminal prompt shows at once. We
-            # send the Discord interactive ask from here, detached, so the
-            # two prompts appear simultaneously. The Discord click is
-            # acknowledged by the daemon (edits the DM) but does not feed
-            # back into the terminal decision — the user still confirms
-            # at the terminal. In "race" mode the PreToolUse hook handled
-            # the Discord ask itself, so we stay silent here to avoid
-            # duplicates.
-            permission_mode = os.environ.get("CC_DISCORD_PERMISSION_MODE", "parallel").lower()
-            if permission_mode != "parallel":
-                safe_exit()
-
-            text = f"**🔐 Claude wants permission**\n{msg or 'Tool approval needed.'}"
-            if cwd:
-                text += f"\n📂 `{Path(cwd).name}`"
-
-            # Find sibling scripts.
-            here = Path(__file__).resolve().parent
-            plugin_root = here.parent
-            client = plugin_root / "bin" / "discord-client.py"
-            daemon = plugin_root / "bin" / "discord-daemon.py"
-            if not client.exists():
-                safe_exit()
-
-            # Spawn the interactive ask in a detached subprocess. Stdout/err
-            # are discarded — nobody listens. The daemon will edit the DM
-            # to show "you tapped …" on click, or "timed out" otherwise.
-            env = os.environ.copy()
-            env["CC_DISCORD_DAEMON"] = str(daemon)
-            timeout = os.environ.get("CC_DISCORD_PERMISSION_TIMEOUT", "60")
-            try:
-                popen_kwargs = {
-                    "stdin": subprocess.DEVNULL,
-                    "stdout": subprocess.DEVNULL,
-                    "stderr": subprocess.DEVNULL,
-                    "env": env,
-                }
-                if os.name == "nt":
-                    popen_kwargs["creationflags"] = 0x00000200 | 0x00000008
-                else:
-                    popen_kwargs["start_new_session"] = True
-                subprocess.Popen(
-                    [sys.executable, str(client), "ask", text,
-                     "--option", "✅ Approve",
-                     "--option", "❌ Deny",
-                     "--timeout", timeout],
-                    **popen_kwargs,
-                )
-            except Exception:
-                pass
-            safe_exit()
-        elif notif_type == "idle_prompt":
+        if notif_type in ("permission_prompt", "idle_prompt"):
             title = "❓ Claude Code is waiting on you"
-            body = msg or "Claude is asking a question."
+            detail = msg or "It's blocked on input — a question, a tool approval, or something it needs you to look at."
         else:
             title = "🔔 Claude Code notification"
-            body = msg or "(no message)"
+            detail = msg or "(no message)"
     elif event == "StopFailure":
         reason_titles = {
-            "rate_limit":            "⏳ Claude Code: rate limited",
-            "authentication_failed": "🔑 Claude Code: auth failed",
-            "oauth_org_not_allowed": "🔑 Claude Code: org not allowed",
-            "billing_error":         "💳 Claude Code: billing error",
-            "max_output_tokens":     "📏 Claude Code: hit output token limit",
-            "invalid_request":       "⚠️ Claude Code: invalid request",
-            "server_error":          "🛑 Claude Code: server error",
+            "rate_limit":            "⏳ Rate limited",
+            "authentication_failed": "🔑 Auth failed",
+            "oauth_org_not_allowed": "🔑 Org not allowed",
+            "billing_error":         "💳 Billing error",
+            "max_output_tokens":     "📏 Hit output token limit",
+            "invalid_request":       "⚠️ Invalid request",
+            "server_error":          "🛑 Server error",
         }
-        title = reason_titles.get(stopfail_reason, "🛑 Claude Code stopped with an error")
-        body = (f"Reason: {stopfail_reason or 'unknown'}. "
-                "The turn ended early — restart or fix the underlying issue.")
+        title = "🛑 Claude Code stopped with an error: " + reason_titles.get(
+            stopfail_reason, stopfail_reason or "unknown")
+        detail = (
+            f"Reason: `{stopfail_reason or 'unknown'}`. The turn ended early — "
+            "restart or fix the underlying issue."
+        )
     else:
         title = f"🔔 Claude Code: {event or 'event'}"
-        body = msg or "(no message)"
+        detail = msg or "(no message)"
 
-    # Cap body at 800 chars (Discord allows 2000, but notifications stay scannable).
-    if len(body) > 800:
-        body = body[:797] + "..."
+    text = _format_dm(notif_type or event, title, detail, cwd)
 
-    text = f"**{title}**\n{body}"
-    if os.environ.get("CC_DISCORD_INCLUDE_DIR", "1") != "0" and cwd:
-        text += f"\n_{cwd}_"
+    delay = os.environ.get("CC_DISCORD_IDLE_DELAY", "30")
+    try:
+        delay_f = float(delay)
+    except ValueError:
+        delay_f = 30.0
+    if delay_f < 0:
+        delay_f = 0.0
 
-    # Find sibling scripts in this plugin's bin/.
     here = Path(__file__).resolve().parent
     plugin_root = here.parent
     client = plugin_root / "bin" / "discord-client.py"
     daemon = plugin_root / "bin" / "discord-daemon.py"
-
     if not client.exists():
-        # Misinstall; nothing we can do silently.
         safe_exit()
 
-    # Run the client. Inherit our Python interpreter — that's the one with
-    # websockets, presumably. Fire and forget; suppress all output, never block
-    # Claude Code.
     env = os.environ.copy()
     env["CC_DISCORD_DAEMON"] = str(daemon)
 
     try:
-        # Short overall timeout — the daemon should answer fast. If it has to
-        # cold-start, that takes a few seconds but the client waits for it.
         result = subprocess.run(
-            [sys.executable, str(client), "notify", text],
+            [sys.executable, str(client), "defer-notify",
+             "--key", key, "--delay", str(delay_f), text],
             input="",
             capture_output=True,
             text=True,
             timeout=20,
             env=env,
         )
-        # On error, append to log (debug only, opt-in).
         if result.returncode != 0 and os.environ.get("CC_DISCORD_DEBUG", "0") == "1":
             log = claude_dir / "cc-discord.log"
             try:
                 with log.open("a", encoding="utf-8") as f:
-                    f.write(f"[{time.strftime('%F %T')}] client rc={result.returncode}: "
+                    f.write(f"[{time.strftime('%F %T')}] defer-notify rc={result.returncode}: "
                             f"stderr={result.stderr.strip()[:300]}\n")
             except Exception:
                 pass
@@ -278,5 +238,4 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except BaseException:
-        # Never let any error escape this hook.
         safe_exit()

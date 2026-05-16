@@ -347,6 +347,11 @@ class Daemon:
         self.resume_url = None
         self.ready_event = asyncio.Event()
         self.started_at = time.time()
+        # Deferred notifications: session_id -> asyncio.Task. A new hook fires
+        # `defer_notify` to schedule a DM N seconds out. PostToolUse and
+        # UserPromptSubmit fire `cancel_deferred` if the user gets back to work
+        # before the timer elapses, suppressing the DM.
+        self._deferred: dict = {}
 
     async def run_gateway(self):
         backoff = 1
@@ -553,6 +558,56 @@ class Daemon:
         await asyncio.to_thread(send_message, self.token, channel, text)
         return {"ok": True}
 
+    async def do_defer_notify(self, key: str, text: str, delay: float) -> dict:
+        """Schedule a DM for `delay` seconds from now, keyed by `key`.
+
+        If another defer with the same key arrives, the previous timer is
+        cancelled and replaced (most recent reason wins). cancel_deferred
+        cancels any timer for that key. The actual DM fires only if the
+        timer reaches zero without being cancelled.
+        """
+        if not key:
+            return {"ok": False, "error": "missing key"}
+
+        existing = self._deferred.pop(key, None)
+        if existing and not existing.done():
+            existing.cancel()
+
+        async def _fire():
+            try:
+                await asyncio.sleep(delay)
+                await self.do_notify(text)
+                log.info("deferred DM fired for key=%s", key)
+            except asyncio.CancelledError:
+                log.info("deferred DM cancelled for key=%s", key)
+                raise
+            except Exception as e:
+                log.warning("deferred DM failed for key=%s: %s", key, e)
+            finally:
+                self._deferred.pop(key, None)
+
+        task = asyncio.create_task(_fire())
+        self._deferred[key] = task
+        log.info("deferred DM scheduled key=%s delay=%ss", key, delay)
+        return {"ok": True, "scheduled": True}
+
+    async def do_cancel_deferred(self, key: str) -> dict:
+        """Cancel a pending deferred DM. If key is empty/None, cancel all."""
+        if not key:
+            cancelled = 0
+            for k, task in list(self._deferred.items()):
+                if not task.done():
+                    task.cancel()
+                    cancelled += 1
+                self._deferred.pop(k, None)
+            return {"ok": True, "cancelled": cancelled}
+
+        task = self._deferred.pop(key, None)
+        if task and not task.done():
+            task.cancel()
+            return {"ok": True, "cancelled": 1}
+        return {"ok": True, "cancelled": 0}
+
     async def do_ask(self, text: str, options: list, timeout: float) -> dict:
         await self._wait_ready(timeout=30)
         channel = await asyncio.to_thread(open_dm, self.token, self.user_id)
@@ -644,6 +699,14 @@ async def serve_tcp(daemon: Daemon, auth_token: str, stop_event: asyncio.Event):
                         req.get("options") or [],
                         float(req.get("timeout") or 600),
                     )
+                elif cmd == "defer_notify":
+                    resp = await daemon.do_defer_notify(
+                        req.get("key", ""),
+                        req.get("text", ""),
+                        float(req.get("delay") or 30),
+                    )
+                elif cmd == "cancel_deferred":
+                    resp = await daemon.do_cancel_deferred(req.get("key", ""))
                 elif cmd == "status":
                     resp = {
                         "ok": True,

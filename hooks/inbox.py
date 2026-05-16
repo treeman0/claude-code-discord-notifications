@@ -18,6 +18,7 @@ the user from working.
 """
 import json
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -32,16 +33,46 @@ def safe_exit():
     sys.exit(0)
 
 
+def _cancel_deferred(session_id: str):
+    """Best-effort: tell the daemon to drop any pending idle DM for this
+    session. A new user prompt means the user is back at the keyboard."""
+    if not session_id:
+        return
+    here = Path(__file__).resolve().parent
+    plugin_root = here.parent
+    client = plugin_root / "bin" / "discord-client.py"
+    daemon = plugin_root / "bin" / "discord-daemon.py"
+    if not client.exists():
+        return
+    env = os.environ.copy()
+    env["CC_DISCORD_DAEMON"] = str(daemon)
+    try:
+        subprocess.run(
+            [sys.executable, str(client), "--no-start", "cancel-deferred",
+             "--key", session_id],
+            input="", capture_output=True, text=True, timeout=5, env=env,
+        )
+    except Exception:
+        pass
+
+
 def main():
     if os.environ.get("CC_DISCORD_INBOX", "on").lower() in ("off", "0", "false", "no"):
         safe_exit()
 
     # Consume stdin so the harness doesn't see a closed pipe before we
-    # respond. We don't need anything from the payload.
+    # respond. Also extract session_id so we can cancel any pending DM.
+    session_id = ""
     try:
-        sys.stdin.read()
+        raw_in = sys.stdin.read()
+        try:
+            session_id = (json.loads(raw_in) or {}).get("session_id") or ""
+        except Exception:
+            pass
     except Exception:
         pass
+
+    _cancel_deferred(session_id)
 
     if not INBOX_FILE.exists():
         safe_exit()

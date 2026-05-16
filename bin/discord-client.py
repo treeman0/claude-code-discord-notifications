@@ -221,6 +221,37 @@ def cmd_notify(args):
         sys.exit(1)
 
 
+def cmd_defer_notify(args):
+    if not ensure_daemon(args):
+        sys.exit(2)
+    try:
+        resp = send({
+            "cmd": "defer_notify",
+            "key": args.key,
+            "text": args.text,
+            "delay": args.delay,
+        }, timeout=20)
+    except Exception as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+    if not resp.get("ok"):
+        print(f"error: {resp.get('error')}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_cancel_deferred(args):
+    if not ensure_daemon(args):
+        sys.exit(2)
+    try:
+        resp = send({"cmd": "cancel_deferred", "key": args.key or ""}, timeout=20)
+    except Exception as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+    if not resp.get("ok"):
+        print(f"error: {resp.get('error')}", file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_ask(args):
     if not ensure_daemon(args):
         sys.exit(2)
@@ -274,6 +305,20 @@ def main():
     p_notify = sub.add_parser("notify", help="Send a one-way DM")
     p_notify.add_argument("text")
     p_notify.set_defaults(func=cmd_notify)
+
+    p_defer = sub.add_parser("defer-notify",
+                              help="Schedule a DM N seconds out, keyed by session_id")
+    p_defer.add_argument("--key", required=True,
+                          help="Cancellation key (e.g. session_id)")
+    p_defer.add_argument("--delay", type=float, default=30.0,
+                          help="Seconds to wait before sending (default 30)")
+    p_defer.add_argument("text")
+    p_defer.set_defaults(func=cmd_defer_notify)
+
+    p_cancel = sub.add_parser("cancel-deferred",
+                               help="Cancel a pending deferred DM. Omit --key to cancel all.")
+    p_cancel.add_argument("--key", default="", help="Specific key to cancel; default cancels all")
+    p_cancel.set_defaults(func=cmd_cancel_deferred)
 
     p_ask = sub.add_parser("ask", help="Ask a question and wait for reply")
     p_ask.add_argument("text")
