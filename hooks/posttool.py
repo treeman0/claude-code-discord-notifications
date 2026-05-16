@@ -37,6 +37,12 @@ def _cancel_deferred(session_id: str):
 
 
 def main():
+    # If we're inside an auto-retry Claude, don't touch deferred state — the
+    # parent daemon's retry task is keyed by this same session_id and would
+    # otherwise be cancelled mid-run.
+    if os.environ.get("CC_DISCORD_IS_RETRY") == "1":
+        sys.exit(0)
+
     raw = sys.stdin.read() if not sys.stdin.isatty() else ""
     if not raw.strip():
         sys.exit(0)

@@ -57,6 +57,13 @@ def _cancel_deferred(session_id: str):
 
 
 def main():
+    # If we're inside an auto-retry Claude (spawned by the daemon after a
+    # StopFailure), don't drain the inbox or cancel deferred state — those
+    # belong to the parent session. The retry should run its prompt
+    # ("continue") cleanly without our side effects.
+    if os.environ.get("CC_DISCORD_IS_RETRY") == "1":
+        safe_exit()
+
     if os.environ.get("CC_DISCORD_INBOX", "on").lower() in ("off", "0", "false", "no"):
         safe_exit()
 

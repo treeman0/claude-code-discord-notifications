@@ -6,9 +6,15 @@ Fires on Stop, StopFailure, and Notification(permission_prompt|idle_prompt).
 Schedules a deferred DM whose delay depends on the event:
 
     Stop                            → CC_DISCORD_DELAY_STOP        (45s)
-    StopFailure                     → CC_DISCORD_DELAY_ERROR       (15s)
+    StopFailure                     → CC_DISCORD_DELAY_ERROR       (15s) *
     Notification permission_prompt  → CC_DISCORD_DELAY_PERMISSION  (10s)
     Notification idle_prompt        → CC_DISCORD_DELAY_QUESTION    (30s)
+
+* StopFailure no longer just DMs the user after 15s. Instead the daemon
+  waits 15s then auto-spawns `claude --resume <session> -p "continue"` and
+  only DMs the user if THAT retry also fails. The retry-spawned Claude runs
+  with CC_DISCORD_IS_RETRY=1 so this hook bails out immediately inside it
+  and we don't get an infinite recovery loop.
 
 PostToolUse and UserPromptSubmit cancel the pending DM if Claude resumes or
 the user submits a new prompt inside the window. You only get pinged when
@@ -40,6 +46,13 @@ DELAY_ENV_VARS = {
     "question":   "CC_DISCORD_DELAY_QUESTION",
 }
 
+CATEGORY_COLORS = {
+    "stop":       0x22c55e,  # green
+    "error":      0xef4444,  # red
+    "permission": 0xeab308,  # amber
+    "question":   0x3b82f6,  # blue
+}
+
 
 def safe_exit():
     sys.exit(0)
@@ -55,14 +68,18 @@ def _short_cwd(cwd: str) -> str:
         return cwd
 
 
-def _format_dm(title: str, cwd: str) -> str:
-    """One-line title + cwd + mobile link. Markdown-rendered by Discord."""
-    parts = [f"## {title}"]
+def _build_embed(category: str, title: str, cwd: str) -> dict:
+    """A clean, color-coded embed payload — gives consecutive DMs clear visual
+    separation (each one renders with its own bordered card)."""
+    embed = {
+        "color": CATEGORY_COLORS.get(category, 0x5865f2),
+        "title": title,
+        "description": "🔗 [Open Claude Code](https://claude.ai/code)",
+    }
     cwd_short = _short_cwd(cwd)
     if cwd_short:
-        parts.append(f"📂 `{cwd_short}`")
-    parts.append("🔗 Remote control: <https://claude.ai/code>")
-    return "\n".join(parts)
+        embed["footer"] = {"text": f"📂 {cwd_short}"}
+    return embed
 
 
 def _delay_for(category: str) -> float:
@@ -101,6 +118,13 @@ def _classify(event: str, notif_type: str, stopfail_reason: str):
 
 
 def main():
+    # Loop guard: if THIS Claude process is the auto-retry the daemon spawned
+    # after a previous StopFailure, do nothing here. Otherwise the retry's
+    # own Stop/StopFailure would re-arm this whole machinery and we'd never
+    # stop. The daemon owns the "did the retry succeed?" decision.
+    if os.environ.get("CC_DISCORD_IS_RETRY") == "1":
+        safe_exit()
+
     home = Path.home()
     claude_dir = home / ".claude"
     env_file = Path(os.environ.get("CC_DISCORD_ENV_FILE", claude_dir / ".discord.env"))
@@ -138,12 +162,12 @@ def main():
     notif_type = payload.get("notification_type") or ""
     stopfail_reason = payload.get("reason") or ""
     session_id = payload.get("session_id") or ""
+    transcript_path = payload.get("transcript_path") or ""
 
     category, title = _classify(event, notif_type, stopfail_reason)
     if category is None:
         safe_exit()
 
-    text = _format_dm(title, cwd)
     delay_f = _delay_for(category)
     key = session_id or "default"
 
@@ -157,11 +181,33 @@ def main():
     env = os.environ.copy()
     env["CC_DISCORD_DAEMON"] = str(daemon)
 
+    if category == "error":
+        # The daemon waits `delay_f` seconds, then tries `claude --resume`.
+        # If that retry succeeds, no DM. If it fails too, the daemon DMs the
+        # user the prior assistant output and the error info separately.
+        cmd = [
+            sys.executable, str(client), "defer-retry",
+            "--key", key,
+            "--delay", str(delay_f),
+            "--session", session_id,
+            "--transcript", transcript_path,
+            "--cwd", cwd,
+            "--reason", stopfail_reason,
+            "--title", title,
+        ]
+    else:
+        embed = _build_embed(category, title, cwd)
+        cmd = [
+            sys.executable, str(client), "defer-notify",
+            "--key", key,
+            "--delay", str(delay_f),
+            "--embed-json", json.dumps(embed),
+            "",  # text fallback (unused when embed is present)
+        ]
+
     try:
         subprocess.run(
-            [sys.executable, str(client), "defer-notify",
-             "--key", key, "--delay", str(delay_f), text],
-            input="", capture_output=True, text=True, timeout=20, env=env,
+            cmd, input="", capture_output=True, text=True, timeout=20, env=env,
         )
     except Exception:
         pass

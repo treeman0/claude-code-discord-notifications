@@ -208,11 +208,29 @@ def ensure_daemon(args) -> bool:
     return True
 
 
+def _parse_embed(raw: str):
+    if not raw:
+        return None
+    try:
+        embed = json.loads(raw)
+    except Exception as e:
+        print(f"error: --embed-json is not valid JSON: {e}", file=sys.stderr)
+        sys.exit(2)
+    if not isinstance(embed, dict):
+        print("error: --embed-json must decode to an object", file=sys.stderr)
+        sys.exit(2)
+    return embed
+
+
 def cmd_notify(args):
     if not ensure_daemon(args):
         sys.exit(2)
+    req = {"cmd": "notify", "text": args.text}
+    embed = _parse_embed(getattr(args, "embed_json", "") or "")
+    if embed is not None:
+        req["embed"] = embed
     try:
-        resp = send({"cmd": "notify", "text": args.text}, timeout=20)
+        resp = send(req, timeout=20)
     except Exception as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)
@@ -224,11 +242,37 @@ def cmd_notify(args):
 def cmd_defer_notify(args):
     if not ensure_daemon(args):
         sys.exit(2)
+    req = {
+        "cmd": "defer_notify",
+        "key": args.key,
+        "text": args.text,
+        "delay": args.delay,
+    }
+    embed = _parse_embed(getattr(args, "embed_json", "") or "")
+    if embed is not None:
+        req["embed"] = embed
+    try:
+        resp = send(req, timeout=20)
+    except Exception as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+    if not resp.get("ok"):
+        print(f"error: {resp.get('error')}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_defer_retry(args):
+    if not ensure_daemon(args):
+        sys.exit(2)
     try:
         resp = send({
-            "cmd": "defer_notify",
+            "cmd": "defer_retry",
             "key": args.key,
-            "text": args.text,
+            "session_id": args.session or "",
+            "transcript_path": args.transcript or "",
+            "cwd": args.cwd or "",
+            "reason": args.reason or "",
+            "title": args.title or "",
             "delay": args.delay,
         }, timeout=20)
     except Exception as e:
@@ -304,6 +348,9 @@ def main():
 
     p_notify = sub.add_parser("notify", help="Send a one-way DM")
     p_notify.add_argument("text")
+    p_notify.add_argument("--embed-json", default="",
+                          help="JSON-encoded Discord embed object; "
+                               "overrides plain-text content if provided.")
     p_notify.set_defaults(func=cmd_notify)
 
     p_defer = sub.add_parser("defer-notify",
@@ -312,8 +359,31 @@ def main():
                           help="Cancellation key (e.g. session_id)")
     p_defer.add_argument("--delay", type=float, default=30.0,
                           help="Seconds to wait before sending (default 30)")
-    p_defer.add_argument("text")
+    p_defer.add_argument("--embed-json", default="",
+                          help="JSON-encoded Discord embed object; "
+                               "overrides plain-text content if provided.")
+    p_defer.add_argument("text", nargs="?", default="")
     p_defer.set_defaults(func=cmd_defer_notify)
+
+    p_retry = sub.add_parser("defer-retry",
+                              help="Schedule an auto-retry of Claude Code N "
+                                   "seconds out; DM only if the retry also fails.")
+    p_retry.add_argument("--key", required=True,
+                          help="Cancellation key (e.g. session_id)")
+    p_retry.add_argument("--delay", type=float, default=15.0,
+                          help="Seconds to wait before retrying (default 15)")
+    p_retry.add_argument("--session", default="",
+                          help="Claude Code session id to resume")
+    p_retry.add_argument("--transcript", default="",
+                          help="Path to the JSONL transcript (used to DM the "
+                               "prior assistant output if the retry fails)")
+    p_retry.add_argument("--cwd", default="",
+                          help="Working directory for the retry process")
+    p_retry.add_argument("--reason", default="",
+                          help="StopFailure reason from the original failure")
+    p_retry.add_argument("--title", default="",
+                          help="Title to use in the failure DM")
+    p_retry.set_defaults(func=cmd_defer_retry)
 
     p_cancel = sub.add_parser("cancel-deferred",
                                help="Cancel a pending deferred DM. Omit --key to cancel all.")

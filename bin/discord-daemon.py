@@ -159,6 +159,210 @@ def _api(method: str, path: str, token: str, body: Optional[dict] = None) -> dic
         raise RuntimeError(f"Discord API {method} {path}: HTTP {e.code} {err_body}") from None
 
 
+# ---- Retry helpers ---------------------------------------------------------
+# StopFailure-recovery path: wait 15s, then spawn `claude --resume` to try to
+# pick up where the failed turn left off. If THAT also fails, we DM the user
+# the prior assistant output + the error so they can fix things from their
+# phone. The retry process must run with CC_DISCORD_IS_RETRY=1 so its own
+# notify.py hooks bail out immediately and we don't get an infinite loop.
+
+RETRY_TIMEOUT_SEC = 600.0  # cap how long we wait for the retried Claude run
+
+
+def _find_claude_cli() -> Optional[str]:
+    """Locate the `claude` executable cross-platform."""
+    import shutil
+    found = shutil.which("claude")
+    if found:
+        return found
+    # Windows fallback — npm global installs land in %APPDATA%\npm\.
+    if os.name == "nt":
+        candidates = [
+            Path(os.environ.get("APPDATA", "")) / "npm" / "claude.cmd",
+            Path(os.environ.get("APPDATA", "")) / "npm" / "claude.exe",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs"
+                / "claude" / "claude.exe",
+        ]
+        for c in candidates:
+            if c.exists():
+                return str(c)
+    return None
+
+
+async def _try_resume(session_id: str, cwd: str):
+    """Spawn `claude --resume <session> -p "continue"` in `cwd` with the
+    loop-guard env var. Returns (ok, stderr_excerpt, returncode).
+
+    Extra CLI args can be appended via the CC_DISCORD_RETRY_ARGS env var
+    (whitespace-split), e.g. to enable specific tools in headless mode:
+        CC_DISCORD_RETRY_ARGS="--allowed-tools Edit,Read,Bash"
+    """
+    import shlex
+    claude_bin = _find_claude_cli()
+    if not claude_bin:
+        return (False, "claude CLI not found on PATH", -1)
+    args = [claude_bin, "-p", "Please continue from where you left off."]
+    if session_id:
+        args[1:1] = ["--resume", session_id]
+    extra = os.environ.get("CC_DISCORD_RETRY_ARGS", "").strip()
+    if extra:
+        try:
+            args.extend(shlex.split(extra, posix=(os.name != "nt")))
+        except Exception as e:
+            log.warning("ignored malformed CC_DISCORD_RETRY_ARGS=%r: %s", extra, e)
+    env = os.environ.copy()
+    env["CC_DISCORD_IS_RETRY"] = "1"
+    workdir = cwd if cwd and Path(cwd).is_dir() else None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, cwd=workdir, env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError as e:
+        return (False, f"failed to spawn claude: {e}", -1)
+    try:
+        _stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=RETRY_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return (False, f"claude retry timed out after {int(RETRY_TIMEOUT_SEC)}s",
+                -1)
+    rc = proc.returncode or 0
+    err_text = ""
+    if stderr:
+        try:
+            err_text = stderr.decode("utf-8", errors="replace").strip()
+        except Exception:
+            err_text = ""
+    return (rc == 0, err_text, rc)
+
+
+def _read_last_assistant_text(transcript_path: str) -> str:
+    """Best-effort: pull the last assistant text-content from a JSONL transcript.
+
+    Returns '' when the file is missing/unreadable or has no usable content.
+    """
+    if not transcript_path:
+        return ""
+    try:
+        p = Path(transcript_path)
+        if not p.exists():
+            return ""
+        # Read up to ~2 MB from the tail of the file — transcripts can be large.
+        size = p.stat().st_size
+        with p.open("rb") as f:
+            if size > 2_000_000:
+                f.seek(size - 2_000_000)
+                f.readline()  # discard partial line
+            raw = f.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+    last = ""
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        msg = obj.get("message") if isinstance(obj, dict) else None
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        text_chunks = []
+        if isinstance(content, str):
+            text_chunks.append(content)
+        elif isinstance(content, list):
+            for blk in content:
+                if isinstance(blk, dict) and blk.get("type") == "text":
+                    t = blk.get("text") or ""
+                    if t:
+                        text_chunks.append(t)
+        if text_chunks:
+            last = "\n".join(text_chunks).strip()
+    return last
+
+
+def _short_cwd(cwd: str) -> str:
+    if not cwd:
+        return ""
+    try:
+        parts = Path(cwd).parts
+        return "/".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
+    except Exception:
+        return cwd
+
+
+CATEGORY_COLORS = {
+    "stop":          0x22c55e,  # green
+    "error":         0xef4444,  # red
+    "permission":    0xeab308,  # amber
+    "question":      0x3b82f6,  # blue
+    "retry_output":  0x6b7280,  # gray (prior output context)
+    "retry_error":   0xb91c1c,  # deep red (final failure)
+    "inbox_ack":     0x6b7280,  # gray
+}
+
+
+def _truncate(s: str, n: int) -> str:
+    if not s:
+        return ""
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _build_prior_output_embed(transcript_path: str, cwd: str) -> Optional[dict]:
+    """Embed showing the last assistant output, sent before the error embed
+    so the user has context. Returns None if there's no usable content."""
+    body = _read_last_assistant_text(transcript_path)
+    if not body:
+        return None
+    # Discord embed description cap is 4096; budget a bit less to be safe.
+    body = _truncate(body, 3800)
+    embed = {
+        "color": CATEGORY_COLORS["retry_output"],
+        "title": "📝 What Claude had said before the failure",
+        "description": body,
+    }
+    cwd_short = _short_cwd(cwd)
+    if cwd_short:
+        embed["footer"] = {"text": f"📂 {cwd_short}"}
+    return embed
+
+
+def _build_retry_error_embed(original_title: str, reason: str,
+                             retry_stderr: str, retry_returncode: int,
+                             cwd: str) -> dict:
+    """Embed announcing that both the original turn and the auto-retry failed."""
+    lines = []
+    if reason:
+        lines.append(f"**Original error:** `{_truncate(reason, 200)}`")
+    rc_part = f" (exit {retry_returncode})" if retry_returncode != 0 else ""
+    lines.append(f"**Retry result:** failed{rc_part}")
+    if retry_stderr:
+        snippet = _truncate(retry_stderr, 1500)
+        lines.append("```\n" + snippet + "\n```")
+    lines.append("🔗 [Open Claude Code](https://claude.ai/code)")
+    embed = {
+        "color": CATEGORY_COLORS["retry_error"],
+        "title": original_title or "🛑 Claude Code error",
+        "description": "\n".join(lines),
+    }
+    cwd_short = _short_cwd(cwd)
+    if cwd_short:
+        embed["footer"] = {"text": f"📂 {cwd_short} · auto-retry after 15s also failed"}
+    else:
+        embed["footer"] = {"text": "auto-retry after 15s also failed"}
+    return embed
+
+
 def open_dm(token: str, user_id: str) -> str:
     if user_id in DM_CHANNEL_CACHE:
         return DM_CHANNEL_CACHE[user_id]
@@ -167,27 +371,43 @@ def open_dm(token: str, user_id: str) -> str:
     return ch["id"]
 
 
-def send_message(token: str, channel_id: str, content: str,
-                 components: Optional[list] = None) -> dict:
-    body = {"content": content}
+def send_message(token: str, channel_id: str, content: str = "",
+                 components: Optional[list] = None,
+                 embeds: Optional[list] = None) -> dict:
+    body: dict = {}
+    if content:
+        body["content"] = content
     if components:
         body["components"] = components
+    if embeds:
+        body["embeds"] = embeds
+    if not body:
+        # Discord rejects empty messages; default to a benign space.
+        body["content"] = " "
     return _api("POST", f"/channels/{channel_id}/messages", token, body)
 
 
 def edit_message(token: str, channel_id: str, message_id: str,
-                 content: str, remove_components: bool = True) -> None:
+                 content: str = "", remove_components: bool = True,
+                 embeds: Optional[list] = None) -> None:
     """Edit a previously-sent message; optionally strip its components.
 
     Used to clean up DM ask messages when the answer arrived elsewhere
     (terminal prompt, timeout). Removing components prevents the user from
     tapping a stale button and getting an 'interaction failed' error.
 
+    Passing `embeds=[...]` replaces the embed list; passing `embeds=[]` clears
+    embeds. Omit (None) to leave embeds untouched.
+
     Best-effort. Logs and continues on failure.
     """
-    body = {"content": content}
+    body: dict = {}
+    if content or embeds is not None:
+        body["content"] = content or ""
     if remove_components:
         body["components"] = []
+    if embeds is not None:
+        body["embeds"] = embeds
     try:
         _api("PATCH", f"/channels/{channel_id}/messages/{message_id}", token, body)
     except Exception as e:
@@ -221,14 +441,17 @@ def ack_interaction_deferred(interaction_id: str, interaction_token: str) -> Non
 
 
 def edit_original_interaction_response(application_id: str, interaction_token: str,
-                                       new_content: str) -> None:
+                                       new_content: str = "",
+                                       embeds: Optional[list] = None) -> None:
     """Edit the original message after a deferred ACK.
 
     Uses the interaction webhook PATCH endpoint. Token is valid 15 minutes.
     No 3-second deadline; safe to do at any pace.
     """
     url = f"{API_BASE}/webhooks/{application_id}/{interaction_token}/messages/@original"
-    body = {"content": new_content, "components": []}
+    body: dict = {"content": new_content or "", "components": []}
+    if embeds is not None:
+        body["embeds"] = embeds
     req = urllib.request.Request(
         url, data=json.dumps(body).encode(), method="PATCH",
         headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
@@ -482,12 +705,14 @@ class Daemon:
                 try:
                     channel_id = d.get("channel_id")
                     if channel_id:
-                        ack = (
-                            "📥 Queued for Claude Code "
-                            f"(will be picked up on your next prompt)."
-                        )
+                        ack_embed = {
+                            "color": CATEGORY_COLORS["inbox_ack"],
+                            "title": "📥 Queued for Claude Code",
+                            "description": "Will be picked up on your next prompt.",
+                        }
                         await asyncio.to_thread(
-                            send_message, self.token, channel_id, ack,
+                            send_message, self.token, channel_id, "",
+                            None, [ack_embed],
                         )
                 except Exception as e:
                     log.warning("inbox ack send failed: %s", e)
@@ -499,11 +724,17 @@ class Daemon:
         # so it doesn't sit there with live buttons that go nowhere.
         if entry and entry.get("channel_id") and entry.get("message_id"):
             original = entry.get("original_text") or "(question)"
-            new_text = f"❓ {original}\n💬 **Replied: {content[:200]}**"
+            answered_embed = {
+                "color": CATEGORY_COLORS["stop"],
+                "title": "❓ Claude has a question",
+                "description": (
+                    f"{original}\n\n💬 **Replied:** {content[:1500]}"
+                ),
+            }
             asyncio.create_task(asyncio.to_thread(
                 edit_message, self.token,
                 entry["channel_id"], entry["message_id"],
-                new_text, True,
+                "", True, [answered_embed],
             ))
 
     async def _on_interaction(self, d: dict):
@@ -542,23 +773,31 @@ class Daemon:
         # We use the interaction webhook PATCH endpoint, which is valid for
         # 15 minutes regardless of how long the ACK took.
         original = (entry or {}).get("original_text") or "(question)"
-        edited = f"❓ {original}\n✅ **You tapped: {answer}**"
+        tapped_embed = {
+            "color": CATEGORY_COLORS["stop"],
+            "title": "❓ Claude has a question",
+            "description": f"{original}\n\n✅ **You tapped:** {answer}",
+        }
         application_id = self.bot_user_id  # populated from READY event
         if application_id:
             asyncio.create_task(asyncio.to_thread(
                 edit_original_interaction_response,
-                application_id, interaction_token, edited,
+                application_id, interaction_token, "", [tapped_embed],
             ))
         else:
             log.warning("bot_user_id not set; skipping interaction edit")
 
-    async def do_notify(self, text: str) -> dict:
+    async def do_notify(self, text: str = "",
+                        embed: Optional[dict] = None) -> dict:
         await self._wait_ready(timeout=30)
         channel = await asyncio.to_thread(open_dm, self.token, self.user_id)
-        await asyncio.to_thread(send_message, self.token, channel, text)
+        embeds = [embed] if embed else None
+        await asyncio.to_thread(send_message, self.token, channel,
+                                text, None, embeds)
         return {"ok": True}
 
-    async def do_defer_notify(self, key: str, text: str, delay: float) -> dict:
+    async def do_defer_notify(self, key: str, text: str, delay: float,
+                              embed: Optional[dict] = None) -> dict:
         """Schedule a DM for `delay` seconds from now, keyed by `key`.
 
         If another defer with the same key arrives, the previous timer is
@@ -576,7 +815,7 @@ class Daemon:
         async def _fire():
             try:
                 await asyncio.sleep(delay)
-                await self.do_notify(text)
+                await self.do_notify(text, embed)
                 log.info("deferred DM fired for key=%s", key)
             except asyncio.CancelledError:
                 log.info("deferred DM cancelled for key=%s", key)
@@ -608,11 +847,86 @@ class Daemon:
             return {"ok": True, "cancelled": 1}
         return {"ok": True, "cancelled": 0}
 
+    async def do_defer_retry(self, key: str, session_id: str,
+                             transcript_path: str, cwd: str,
+                             reason: str, title: str, delay: float) -> dict:
+        """On StopFailure, wait `delay` seconds then try to resume Claude Code
+        via `claude --resume <session> -p continue`. If the retry process
+        succeeds, do nothing. If it fails (non-zero exit or timeout), DM the
+        user the prior assistant output and the error details as two separate
+        messages.
+
+        Uses CC_DISCORD_IS_RETRY=1 in the subprocess env so the retry-spawned
+        Claude's own notify.py hook exits early and doesn't loop forever.
+        """
+        if not key:
+            return {"ok": False, "error": "missing key"}
+
+        existing = self._deferred.pop(key, None)
+        if existing and not existing.done():
+            existing.cancel()
+
+        async def _fire():
+            try:
+                await asyncio.sleep(delay)
+                # Past this point the retry is committed: remove ourselves
+                # from `_deferred` so cancel_deferred (PostToolUse / new user
+                # prompt in another window) can't cancel an in-flight retry
+                # subprocess. Belt-and-suspenders with CC_DISCORD_IS_RETRY=1
+                # in the spawned process's env.
+                self._deferred.pop(key, None)
+                log.info("retry: attempting resume for session=%s", session_id)
+                retry_ok, retry_stderr, retry_returncode = await _try_resume(
+                    session_id, cwd,
+                )
+                if retry_ok:
+                    log.info("retry: resume succeeded for session=%s", session_id)
+                    return
+                log.info("retry: resume failed (rc=%s) — DMing user",
+                         retry_returncode)
+                prior_embed = _build_prior_output_embed(transcript_path, cwd)
+                err_embed = _build_retry_error_embed(
+                    title, reason, retry_stderr, retry_returncode, cwd,
+                )
+                try:
+                    if prior_embed is not None:
+                        await self.do_notify("", prior_embed)
+                    await self.do_notify("", err_embed)
+                except Exception as e:
+                    log.warning("retry DM failed: %s", e)
+            except asyncio.CancelledError:
+                log.info("retry cancelled for key=%s", key)
+                raise
+            except Exception as e:
+                log.warning("retry task failed for key=%s: %s", key, e)
+            finally:
+                self._deferred.pop(key, None)
+
+        task = asyncio.create_task(_fire())
+        self._deferred[key] = task
+        log.info("retry scheduled key=%s delay=%ss session=%s",
+                 key, delay, session_id)
+        return {"ok": True, "scheduled": True}
+
     async def do_ask(self, text: str, options: list, timeout: float) -> dict:
         await self._wait_ready(timeout=30)
         channel = await asyncio.to_thread(open_dm, self.token, self.user_id)
         components = self._build_components(options) if options else None
-        msg = await asyncio.to_thread(send_message, self.token, channel, text, components)
+        ask_embed = {
+            "color": CATEGORY_COLORS["question"],
+            "title": "❓ Claude has a question",
+            "description": text,
+            "footer": {
+                "text": (
+                    f"Tap an option or reply to answer · times out in {int(timeout)}s"
+                    if options
+                    else f"Reply to answer · times out in {int(timeout)}s"
+                ),
+            },
+        }
+        msg = await asyncio.to_thread(
+            send_message, self.token, channel, "", components, [ask_embed],
+        )
         message_id = msg["id"]
 
         request_id = secrets.token_hex(8)
@@ -632,14 +946,19 @@ class Daemon:
             entry = self.pending.cancel(request_id)
             if entry and entry.get("channel_id") and entry.get("message_id"):
                 original = entry.get("original_text") or "(question)"
-                new_text = (
-                    f"❓ {original}\n"
-                    f"⏱️ **Timed out after {int(timeout)}s — answered elsewhere or no longer needed.**"
-                )
+                timed_out_embed = {
+                    "color": CATEGORY_COLORS["retry_output"],
+                    "title": "❓ Claude has a question",
+                    "description": (
+                        f"{original}\n\n"
+                        f"⏱️ **Timed out after {int(timeout)}s** — answered "
+                        "elsewhere or no longer needed."
+                    ),
+                }
                 asyncio.create_task(asyncio.to_thread(
                     edit_message, self.token,
                     entry["channel_id"], entry["message_id"],
-                    new_text, True,
+                    "", True, [timed_out_embed],
                 ))
             return {"ok": False, "error": "timeout",
                     "message": f"No reply received within {int(timeout)}s."}
@@ -692,7 +1011,10 @@ async def serve_tcp(daemon: Daemon, auth_token: str, stop_event: asyncio.Event):
             cmd = req.get("cmd")
             try:
                 if cmd == "notify":
-                    resp = await daemon.do_notify(req.get("text", ""))
+                    resp = await daemon.do_notify(
+                        req.get("text", ""),
+                        req.get("embed"),
+                    )
                 elif cmd == "ask":
                     resp = await daemon.do_ask(
                         req.get("text", ""),
@@ -704,6 +1026,17 @@ async def serve_tcp(daemon: Daemon, auth_token: str, stop_event: asyncio.Event):
                         req.get("key", ""),
                         req.get("text", ""),
                         float(req.get("delay") or 30),
+                        req.get("embed"),
+                    )
+                elif cmd == "defer_retry":
+                    resp = await daemon.do_defer_retry(
+                        req.get("key", ""),
+                        req.get("session_id", ""),
+                        req.get("transcript_path", ""),
+                        req.get("cwd", ""),
+                        req.get("reason", ""),
+                        req.get("title", ""),
+                        float(req.get("delay") or 15),
                     )
                 elif cmd == "cancel_deferred":
                     resp = await daemon.do_cancel_deferred(req.get("key", ""))
