@@ -37,9 +37,18 @@ from pathlib import Path
 # ---- Defaults --------------------------------------------------------------
 
 DEFAULT_SKIP_TOOLS = {
+    # Read-only / non-side-effecting tools.
     "Read", "Glob", "Grep", "TodoWrite", "NotebookRead",
     "WebFetch", "WebSearch",
+    # Task management — internal bookkeeping, no external effects.
+    "TaskCreate", "TaskUpdate", "TaskList", "TaskGet", "TaskOutput", "TaskStop",
 }
+
+# File-modifying tools. Auto-allowed when the target file is within the
+# session's cwd ("in scope"). Out-of-scope edits still prompt, since the user
+# usually doesn't intend to touch ~/.bashrc, /etc, or sibling repos from a
+# project session.
+SCOPED_FILE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 
 # Bash commands considered safe (read-only or test execution). The regex
 # matches the start of the command after optional env-var assignments.
@@ -47,24 +56,41 @@ DEFAULT_SAFE_BASH_RE = re.compile(
     r"^\s*"
     r"(?:[A-Z_][A-Z0-9_]*=\S+\s+)*"          # leading FOO=bar assignments
     r"(?:"
-    r"ls|cat|head|tail|less|more|file|stat|wc|"
+    # File/dir inspection
+    r"ls|cat|head|tail|less|more|file|stat|wc|du|df|tree|"
+    # Search
     r"grep|find|fd|rg|ack|"
+    # Path / identity / system inspection
     r"pwd|which|where|whereis|type|hostname|whoami|id|env|date|uptime|"
-    r"echo|printf|true|false|"
+    r"uname|realpath|readlink|dirname|basename|"
+    # Trivial output / no-op
+    r"echo|printf|true|false|sleep|"
+    # Archive *inspection* only (extraction would be a side effect)
+    r"tar\s+-?t\S*|unzip\s+-l|zipinfo|"
+    # Git read-only
     r"git\s+(?:status|log|diff|branch|show|remote|config\s+--get|describe|rev-parse|tag|"
     r"ls-files|ls-remote|stash\s+list|reflog\s+show|cherry|cat-file|"
-    r"shortlog|whatchanged|fsck|gc\s+--auto|count-objects)\b|"
+    r"shortlog|whatchanged|fsck|gc\s+--auto|count-objects|blame)\b|"
+    # JS package managers — test / inspect only
     r"npm\s+(?:test|run\s+test|run\s+lint|run\s+type-?check|run\s+typecheck|"
     r"ls|ll|list|outdated|view|info|search|--version|-v|run\s+--list)\b|"
     r"pnpm\s+(?:test|run\s+test|run\s+lint|ls|outdated|--version|-v)\b|"
     r"yarn\s+(?:test|run\s+test|run\s+lint|outdated|why|--version|-v)\b|"
+    # Python testing
     r"pytest|"
     r"python\s+-m\s+pytest|python3\s+-m\s+pytest|"
+    # Rust
     r"cargo\s+(?:test|check|clippy|fmt\s+--check|build\s+--dry-run|tree|--version|-V)\b|"
+    # Go
     r"go\s+(?:test|vet|build|version|env|list|doc|fmt\s+-n)\b|"
+    # --version / --help on common toolchains
     r"node\s+--version|python\s+--version|python3\s+--version|"
     r"npm\s+--version|pnpm\s+--version|yarn\s+--version|"
-    r"git\s+--version|rustc\s+--version|cargo\s+--version|go\s+version"
+    r"git\s+--version|rustc\s+--version|cargo\s+--version|go\s+version|"
+    r"docker\s+(?:--version|version|ps|images|info)|"
+    r"kubectl\s+(?:version|get|describe|cluster-info|config\s+view)|"
+    r"make\s+(?:-n|--dry-run|--question|--help|--version|--print-data-base)|"
+    r"mkdir\s+-p"  # -p is idempotent; no -R style here
     r")\b"
 )
 
@@ -85,9 +111,18 @@ def emit(decision: str, reason: str = ""):
     sys.exit(0)
 
 
-def ask_fallback():
-    """Defer to Claude Code's normal permission prompt."""
-    emit("ask", "cc-discord couldn't reach Discord; falling back to terminal prompt")
+def ask_fallback(reason: str = ""):
+    """Defer to Claude Code's normal permission prompt.
+
+    The optional reason is appended to the decision message so the terminal
+    fallback isn't opaque — e.g., "daemon not running", "ask timed out",
+    "unparseable reply". Helpful when diagnosing intermittent fallbacks.
+    """
+    base = "cc-discord falling back to terminal prompt"
+    if reason:
+        emit("ask", f"{base}: {reason}")
+    else:
+        emit("ask", base)
 
 
 def allow(reason: str = "auto-allowed by cc-discord skip list"):
@@ -135,6 +170,31 @@ def safe_bash_re() -> re.Pattern:
         except re.error:
             pass
     return DEFAULT_SAFE_BASH_RE
+
+
+def is_in_scope(file_path: str, cwd: str) -> bool:
+    """True if file_path is at or under cwd after path resolution.
+
+    Relative paths are resolved against the session's cwd (the hook payload's
+    cwd, not the Python process's cwd) so that "README.md" in a session
+    rooted at /proj is treated as /proj/README.md regardless of where
+    permission.py itself was launched from.
+
+    Resolution walks symlinks and `..` segments so that
+    "/proj/../../../etc/passwd" correctly reports out-of-scope. Returns
+    False on malformed paths or empty inputs (i.e., we fail closed).
+    """
+    if not file_path or not cwd:
+        return False
+    try:
+        fp = Path(file_path)
+        if not fp.is_absolute():
+            fp = Path(cwd) / fp
+        fp = fp.resolve(strict=False)
+        scope = Path(cwd).resolve(strict=False)
+    except Exception:
+        return False
+    return fp == scope or scope in fp.parents
 
 
 def is_safe_bash(command: str) -> bool:
@@ -187,10 +247,11 @@ def build_prompt(tool_name: str, tool_input: dict, cwd: str) -> str:
 def ask_discord(text: str, options: list, timeout: float,
                 client_path: Path, daemon_path: Path,
                 subprocess_timeout: float = None) -> tuple:
-    """Ask Discord a question with the given options. Returns (ok, answer).
+    """Ask Discord a question with the given options. Returns (ok, answer, reason).
 
     ok=False means timeout, daemon error, or unparseable answer — caller should
-    fall back. ok=True with the answer string lets caller match against options.
+    fall back and surface the reason. ok=True returns the answer string for
+    matching against options. reason is always a short human-readable string.
     """
     if subprocess_timeout is None:
         subprocess_timeout = timeout + 10
@@ -204,15 +265,21 @@ def ask_discord(text: str, options: list, timeout: float,
 
     try:
         result = subprocess.run(
-            cmd, input="", capture_output=True, text=True,
+            cmd, input="", capture_output=True,
+            encoding="utf-8", errors="replace",
             timeout=subprocess_timeout, env=env,
         )
-    except Exception:
-        return (False, None)
+    except subprocess.TimeoutExpired:
+        return (False, None, "ask subprocess timed out")
+    except Exception as e:
+        return (False, None, f"ask subprocess failed: {e}")
 
     if result.returncode != 0:
-        return (False, None)
-    return (True, (result.stdout or "").strip())
+        # discord-client writes its error to stderr (e.g. "(no reply: timeout)",
+        # "error: daemon failed to start within 15s"). Surface the first line.
+        err = ((result.stderr or "").strip().splitlines() or [""])[0]
+        return (False, None, err or f"discord-client exit {result.returncode}")
+    return (True, (result.stdout or "").strip(), "")
 
 
 def handle_ask_user_question(tool_input: dict, cwd: str,
@@ -229,7 +296,7 @@ def handle_ask_user_question(tool_input: dict, cwd: str,
     questions = tool_input.get("questions") or []
     if not questions:
         # Nothing to ask — let normal flow handle it.
-        ask_fallback()
+        ask_fallback("AskUserQuestion had no questions")
         return
 
     # Pre-flight intro DM so the user knows what's coming if there are
@@ -274,7 +341,7 @@ def handle_ask_user_question(tool_input: dict, cwd: str,
 
         if not labels:
             # Question with no options — fall back to terminal.
-            ask_fallback()
+            ask_fallback("question had no option labels")
             return
 
         # Build a richer DM body with the descriptions, since buttons only
@@ -296,11 +363,11 @@ def handle_ask_user_question(tool_input: dict, cwd: str,
                 body_lines.append(f"• **{label}**")
         prompt_text = "\n".join(body_lines)
 
-        ok, answer = ask_discord(
+        ok, answer, reason = ask_discord(
             prompt_text, labels, timeout, client_path, daemon_path,
         )
         if not ok or not answer:
-            ask_fallback()
+            ask_fallback(reason or "no reply")
             return
 
         # Match answer to a label. Buttons return the exact label they were
@@ -326,7 +393,7 @@ def handle_ask_user_question(tool_input: dict, cwd: str,
 
         if chosen_label is None:
             # Unparseable answer. Bail out to terminal prompt.
-            ask_fallback()
+            ask_fallback(f"reply {answer!r} did not match any option")
             return
 
         answers[qtext] = chosen_label
@@ -383,6 +450,14 @@ def main():
         if is_safe_bash(cmd):
             allow("Safe Bash command")
 
+    # File-modifying tools auto-allow when the target file is within the
+    # session's working directory. Out-of-scope edits fall through to the
+    # normal Discord prompt so the user can confirm.
+    if tool_name in SCOPED_FILE_TOOLS:
+        fp = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
+        if fp and is_in_scope(fp, cwd):
+            allow(f"{tool_name} within session scope")
+
     # Daemon check before we try to ask.
     env_file = Path(os.environ.get("CC_DISCORD_ENV_FILE",
                                    Path.home() / ".claude" / ".discord.env"))
@@ -429,17 +504,21 @@ def main():
              "--timeout", str(timeout)],
             input="",
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=subprocess_timeout,
             env=env,
         )
-    except Exception:
-        ask_fallback()  # subprocess crashed somehow
-        return  # not reached
+    except subprocess.TimeoutExpired:
+        ask_fallback("ask subprocess timed out")
+        return
+    except Exception as e:
+        ask_fallback(f"ask subprocess failed: {e}")
+        return
 
     if result.returncode != 0:
-        # Daemon down, timeout, or generic error — fall back to terminal.
-        ask_fallback()
+        err = ((result.stderr or "").strip().splitlines() or [""])[0]
+        ask_fallback(err or f"discord-client exit {result.returncode}")
         return
 
     answer = (result.stdout or "").strip()
@@ -450,7 +529,7 @@ def main():
     else:
         # User typed something free-form. Be conservative: treat as "ask"
         # rather than auto-allow or auto-deny.
-        ask_fallback()
+        ask_fallback(f"reply {answer!r} was neither approve nor deny")
 
 
 if __name__ == "__main__":

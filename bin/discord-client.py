@@ -26,6 +26,15 @@ import sys
 import time
 from pathlib import Path
 
+# Replies may contain emoji (e.g. "✅ Approve", "❌ Deny"). On Windows, stdout
+# defaults to cp1252 and crashes with UnicodeEncodeError when we print them.
+# Force UTF-8 so the answer round-trips cleanly back to the hook.
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 HOME = Path.home()
 CLAUDE_DIR = HOME / ".claude"
 INFO_FILE = Path(os.environ.get("CC_DISCORD_INFO", CLAUDE_DIR / "discord-daemon.info"))
@@ -118,7 +127,13 @@ def daemon_alive() -> bool:
 
 
 def start_daemon(daemon_script: str) -> bool:
-    """Spawn the daemon detached. Returns True if it came up within ~15s."""
+    """Spawn the daemon detached and wait until it's connected to Discord.
+
+    "Connected" means the gateway READY event has fired — not just that the
+    local socket is listening. If we returned earlier, the next ask/notify
+    would race the gateway handshake and fall back to the terminal whenever
+    READY took longer than the daemon's _wait_ready timeout.
+    """
     if not Path(daemon_script).exists():
         print(f"error: daemon script not found at {daemon_script}", file=sys.stderr)
         return False
@@ -137,10 +152,24 @@ def start_daemon(daemon_script: str) -> bool:
 
     subprocess.Popen([sys.executable, daemon_script], **kwargs)
 
-    # Wait for info file to appear, indicating daemon is listening.
-    for _ in range(150):  # ~15s
+    # Stage 1: wait up to 15s for the info file (local socket listening).
+    for _ in range(150):
         if INFO_FILE.exists() and read_info() is not None:
-            return True
+            break
+        time.sleep(0.1)
+    else:
+        return False
+
+    # Stage 2: poll status until the gateway is READY. WSS handshake + IDENTIFY
+    # + READY is usually <1s but can take noticeably longer on cold Windows
+    # boots and slow networks — budget another 15s here.
+    for _ in range(150):
+        try:
+            resp = send({"cmd": "status"}, timeout=2)
+            if resp.get("ok") and resp.get("ready"):
+                return True
+        except Exception:
+            pass
         time.sleep(0.1)
     return False
 

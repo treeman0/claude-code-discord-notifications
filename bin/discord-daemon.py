@@ -120,6 +120,14 @@ def load_env() -> dict:
 
 # ---- REST helpers -----------------------------------------------------------
 
+# Discord sits behind Cloudflare, which 403s ("error code: 1010") any request
+# whose User-Agent it doesn't recognise — including Python's default
+# "Python-urllib/3.x". Every outbound request to discord.com must set this.
+USER_AGENT = (
+    "DiscordBot (https://github.com/treeman0/claude-code-discord-notifications, 1.0)"
+)
+
+
 def _api(method: str, path: str, token: str, body: Optional[dict] = None) -> dict:
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
@@ -129,7 +137,7 @@ def _api(method: str, path: str, token: str, body: Optional[dict] = None) -> dic
         headers={
             "Authorization": f"Bot {token}",
             "Content-Type": "application/json",
-            "User-Agent": "ClaudeCodeDiscordNotifier (https://github.com/treeman0/claude-code-discord-notifications, 1.0)",
+            "User-Agent": USER_AGENT,
         },
     )
     try:
@@ -198,7 +206,7 @@ def ack_interaction_deferred(interaction_id: str, interaction_token: str) -> Non
     body = {"type": 6}  # DEFERRED_UPDATE_MESSAGE
     req = urllib.request.Request(
         url, data=json.dumps(body).encode(), method="POST",
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
     )
     try:
         if req.full_url.startswith("https://"):
@@ -222,7 +230,7 @@ def edit_original_interaction_response(application_id: str, interaction_token: s
     body = {"content": new_content, "components": []}
     req = urllib.request.Request(
         url, data=json.dumps(body).encode(), method="PATCH",
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
     )
     try:
         if req.full_url.startswith("https://"):
@@ -247,7 +255,7 @@ def ack_interaction(interaction_id: str, interaction_token: str,
     body = {"type": 7, "data": {"content": edited_content, "components": []}}
     req = urllib.request.Request(
         url, data=json.dumps(body).encode(), method="POST",
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
     )
     try:
         if req.full_url.startswith("https://"):
@@ -457,7 +465,7 @@ class Daemon:
         # so it doesn't sit there with live buttons that go nowhere.
         if entry and entry.get("channel_id") and entry.get("message_id"):
             original = entry.get("original_text") or "(question)"
-            new_text = f"❓ ~~{original}~~\n💬 **Replied: {content[:200]}**"
+            new_text = f"❓ {original}\n💬 **Replied: {content[:200]}**"
             asyncio.create_task(asyncio.to_thread(
                 edit_message, self.token,
                 entry["channel_id"], entry["message_id"],
@@ -500,7 +508,7 @@ class Daemon:
         # We use the interaction webhook PATCH endpoint, which is valid for
         # 15 minutes regardless of how long the ACK took.
         original = (entry or {}).get("original_text") or "(question)"
-        edited = f"❓ ~~{original}~~\n✅ **You tapped: {answer}**"
+        edited = f"❓ {original}\n✅ **You tapped: {answer}**"
         application_id = self.bot_user_id  # populated from READY event
         if application_id:
             asyncio.create_task(asyncio.to_thread(
@@ -511,13 +519,13 @@ class Daemon:
             log.warning("bot_user_id not set; skipping interaction edit")
 
     async def do_notify(self, text: str) -> dict:
-        await self._wait_ready(timeout=10)
+        await self._wait_ready(timeout=30)
         channel = await asyncio.to_thread(open_dm, self.token, self.user_id)
         await asyncio.to_thread(send_message, self.token, channel, text)
         return {"ok": True}
 
     async def do_ask(self, text: str, options: list, timeout: float) -> dict:
-        await self._wait_ready(timeout=10)
+        await self._wait_ready(timeout=30)
         channel = await asyncio.to_thread(open_dm, self.token, self.user_id)
         components = self._build_components(options) if options else None
         msg = await asyncio.to_thread(send_message, self.token, channel, text, components)
@@ -541,7 +549,7 @@ class Daemon:
             if entry and entry.get("channel_id") and entry.get("message_id"):
                 original = entry.get("original_text") or "(question)"
                 new_text = (
-                    f"❓ ~~{original}~~\n"
+                    f"❓ {original}\n"
                     f"⏱️ **Timed out after {int(timeout)}s — answered elsewhere or no longer needed.**"
                 )
                 asyncio.create_task(asyncio.to_thread(
