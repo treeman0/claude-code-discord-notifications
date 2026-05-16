@@ -22,10 +22,7 @@ Honored env vars:
     CC_DISCORD_PERMISSION_TIMEOUT   Seconds to wait for a Discord reply
                                     on tool-permission prompts before
                                     falling back to the terminal (default
-                                    10 — the "race window"). The
-                                    AskUserQuestion path uses a separate,
-                                    longer default (180s) since those are
-                                    real questions to the user, not gates.
+                                    10 — the "race window").
     CC_DISCORD_PERMISSION_SKIP      Comma-separated tool names that always
                                     auto-allow (default: read-only tools).
     CC_DISCORD_PERMISSION_BASH_SAFE Override the safe-Bash regex.
@@ -290,181 +287,6 @@ def build_prompt(tool_name: str, tool_input: dict, cwd: str) -> str:
     return "\n".join(parts)
 
 
-def ask_discord(text: str, options: list, timeout: float,
-                client_path: Path, daemon_path: Path,
-                subprocess_timeout: float = None) -> tuple:
-    """Ask Discord a question with the given options. Returns (ok, answer, reason).
-
-    ok=False means timeout, daemon error, or unparseable answer — caller should
-    fall back and surface the reason. ok=True returns the answer string for
-    matching against options. reason is always a short human-readable string.
-    """
-    if subprocess_timeout is None:
-        subprocess_timeout = timeout + 10
-
-    env = os.environ.copy()
-    env["CC_DISCORD_DAEMON"] = str(daemon_path)
-
-    cmd = [sys.executable, str(client_path), "ask", text, "--timeout", str(timeout)]
-    for opt in options:
-        cmd.extend(["--option", opt])
-
-    try:
-        result = subprocess.run(
-            cmd, input="", capture_output=True,
-            encoding="utf-8", errors="replace",
-            timeout=subprocess_timeout, env=env,
-        )
-    except subprocess.TimeoutExpired:
-        return (False, None, "ask subprocess timed out")
-    except Exception as e:
-        return (False, None, f"ask subprocess failed: {e}")
-
-    if result.returncode != 0:
-        # discord-client writes its error to stderr (e.g. "(no reply: timeout)",
-        # "error: daemon failed to start within 15s"). Surface the first line.
-        err = ((result.stderr or "").strip().splitlines() or [""])[0]
-        return (False, None, err or f"discord-client exit {result.returncode}")
-    return (True, (result.stdout or "").strip(), "")
-
-
-def handle_ask_user_question(tool_input: dict, cwd: str,
-                              client_path: Path, daemon_path: Path,
-                              timeout: float):
-    """Special handling for the AskUserQuestion tool.
-
-    Send each question to Discord with its actual options as buttons. Collect
-    the answers and return them as updatedInput so AskUserQuestion runs with
-    pre-filled answers instead of prompting in the terminal.
-
-    On any failure, fall back to terminal prompt (ask).
-    """
-    questions = tool_input.get("questions") or []
-    if not questions:
-        # Nothing to ask — let normal flow handle it.
-        ask_fallback("AskUserQuestion had no questions")
-        return
-
-    # Pre-flight intro DM so the user knows what's coming if there are
-    # multiple questions. Skip for the single-question case (less noise).
-    if len(questions) > 1:
-        intro = f"❓ **Claude needs you to answer {len(questions)} questions**"
-        short_cwd = _short_cwd(cwd)
-        if short_cwd:
-            intro += f"\n📂 `{short_cwd}`"
-        for i, q in enumerate(questions, 1):
-            qtext = (q.get("question") or "").strip()
-            intro += f"\n\n**{i}.** {truncate(qtext, 140)}"
-        # Best-effort notify. We don't block on this — it's just a heads-up.
-        env = os.environ.copy()
-        env["CC_DISCORD_DAEMON"] = str(daemon_path)
-        try:
-            subprocess.run(
-                [sys.executable, str(client_path), "notify", intro],
-                input="", capture_output=True, text=True, timeout=20, env=env,
-            )
-        except Exception:
-            pass
-
-    # Now ask each question with its options.
-    answers = {}
-    for q in questions:
-        qtext = (q.get("question") or "").strip()
-        header = (q.get("header") or "").strip()
-        options_in = q.get("options") or []
-        multi = bool(q.get("multiSelect"))
-
-        # Build the option labels for buttons (Discord caps at 25 buttons).
-        # Each option has {label, description}. Use label as the button text
-        # and as the value we match back.
-        labels = []
-        label_to_option = {}
-        for opt in options_in[:25]:
-            label = (opt.get("label") or "").strip()
-            if not label:
-                continue
-            labels.append(label)
-            label_to_option[label] = opt
-
-        if not labels:
-            # Question with no options — fall back to terminal.
-            ask_fallback("question had no option labels")
-            return
-
-        # Build a richer DM body with the descriptions, since buttons only
-        # show labels.
-        body_lines = [f"**❓ {truncate(qtext, 300)}**"]
-        if header:
-            body_lines.append(f"_{header}_")
-        if multi:
-            body_lines.append("_Multi-select: tap one, or reply with comma-separated labels._")
-        body_lines.append("")  # blank line before options
-        for opt in options_in[:25]:
-            label = (opt.get("label") or "").strip()
-            desc = (opt.get("description") or "").strip()
-            if not label:
-                continue
-            if desc:
-                body_lines.append(f"• **{label}** — {truncate(desc, 120)}")
-            else:
-                body_lines.append(f"• **{label}**")
-        prompt_text = "\n".join(body_lines)
-
-        ok, answer, reason = ask_discord(
-            prompt_text, labels, timeout, client_path, daemon_path,
-        )
-        if not ok or not answer:
-            ask_fallback(reason or "no reply")
-            return
-
-        # Match answer to a label. Buttons return the exact label they were
-        # built with. Free-text replies are matched case-insensitively against
-        # all labels; multi-select free-text comma-separates.
-        chosen_label = None
-        if multi:
-            # Parse comma-separated text or accept a single button label.
-            parts = [p.strip() for p in answer.split(",") if p.strip()]
-            matched = []
-            for part in parts:
-                m = _match_label(part, labels)
-                if m:
-                    matched.append(m)
-            if matched:
-                # Per AskUserQuestion schema, multi-select expects list-like in
-                # the answer string — we'll join with commas.
-                chosen_label = ", ".join(matched)
-        if chosen_label is None:
-            m = _match_label(answer, labels)
-            if m:
-                chosen_label = m
-
-        if chosen_label is None:
-            # Unparseable answer. Bail out to terminal prompt.
-            ask_fallback(f"reply {answer!r} did not match any option")
-            return
-
-        answers[qtext] = chosen_label
-
-    # All questions answered — return as updatedInput.
-    allow_with_answers(answers, questions, reason="Answered on Discord")
-
-
-def _match_label(answer: str, labels: list):
-    """Match an answer string back to one of the available labels."""
-    a = answer.strip()
-    for lbl in labels:
-        if a == lbl:
-            return lbl
-    al = a.lower()
-    for lbl in labels:
-        if al == lbl.lower():
-            return lbl
-    # Substring fallback — useful for "approve" matching "✅ Approve".
-    for lbl in labels:
-        if al in lbl.lower() or lbl.lower() in al:
-            return lbl
-    return None
-
 
 # ---- Main ------------------------------------------------------------------
 
@@ -538,14 +360,13 @@ def main():
     #     terminal. Terminal is hidden during the race.
     permission_mode = os.environ.get("CC_DISCORD_PERMISSION_MODE", "parallel").lower()
 
-    # Special handling for AskUserQuestion: send each question with its real
-    # options as buttons, collect the answers, return them as updatedInput.
+    # AskUserQuestion: let Claude Code's native picker handle it. We tried
+    # a terminal+Discord race here but Claude Code's TUI repaints over any
+    # CONOUT$ writes on Windows, so the custom prompt was unreliable. The
+    # native picker is the only consistently visible terminal UI.
     if tool_name == "AskUserQuestion":
-        # AskUserQuestion is a real question to the user (the model is
-        # asking, not gating). Hold longer so the user can reach their phone.
-        auq_timeout = float(os.environ.get("CC_DISCORD_ASKUSER_TIMEOUT", "180"))
-        handle_ask_user_question(tool_input, cwd, client, daemon, auq_timeout)
-        return  # not reached — the handler always exits
+        ask_fallback("AskUserQuestion handled by native picker")
+        return  # not reached
 
     # parallel mode: defer to terminal + leave it to notify.py to send
     # the Discord prompt. No Discord interaction from this hook.
