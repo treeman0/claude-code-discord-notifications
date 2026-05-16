@@ -16,7 +16,7 @@ Cross-platform: macOS, Linux, and Windows (Git Bash / MSYS / native).
 Inside Claude Code:
 
 ```
-/plugin marketplace add treeman0/claude-code-marketplace
+/plugin marketplace add treeman0/claude-code-discord-notifications
 /plugin install claude-code-discord-notifications@treeman0
 /discord-setup
 ```
@@ -141,6 +141,7 @@ Stop the daemon: `python3 ~/.claude/plugins/cache/claude-code-discord-notificati
 
 ```
 .claude-plugin/
+  marketplace.json     marketplace catalog
   plugin.json          plugin manifest
 hooks/
   hooks.json           hook registrations (auto-applied)
