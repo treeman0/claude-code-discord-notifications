@@ -2,11 +2,17 @@
 """
 cc-discord notification hook (idle-timer mode).
 
-Fires on Stop and StopFailure. Schedules a deferred DM N seconds out
-(default 30, override with CC_DISCORD_IDLE_DELAY). PostToolUse and
-UserPromptSubmit hooks cancel the deferred DM if Claude resumes or the
-user submits a new prompt inside the window, so you only get pinged when
-Claude has actually been idle for the full window.
+Fires on Stop, StopFailure, and Notification(permission_prompt|idle_prompt).
+Schedules a deferred DM whose delay depends on the event:
+
+    Stop                            → CC_DISCORD_DELAY_STOP        (45s)
+    StopFailure                     → CC_DISCORD_DELAY_ERROR       (15s)
+    Notification permission_prompt  → CC_DISCORD_DELAY_PERMISSION  (10s)
+    Notification idle_prompt        → CC_DISCORD_DELAY_QUESTION    (30s)
+
+PostToolUse and UserPromptSubmit cancel the pending DM if Claude resumes or
+the user submits a new prompt inside the window. You only get pinged when
+Claude has actually been idle for the full delay.
 
 The DM is keyed by session_id so multiple parallel Claude Code sessions
 don't clobber each other's pending notifications.
@@ -17,8 +23,22 @@ import json
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
+
+
+DEFAULT_DELAYS = {
+    "stop":       45.0,
+    "error":      15.0,
+    "permission": 10.0,
+    "question":   30.0,
+}
+
+DELAY_ENV_VARS = {
+    "stop":       "CC_DISCORD_DELAY_STOP",
+    "error":      "CC_DISCORD_DELAY_ERROR",
+    "permission": "CC_DISCORD_DELAY_PERMISSION",
+    "question":   "CC_DISCORD_DELAY_QUESTION",
+}
 
 
 def safe_exit():
@@ -43,6 +63,41 @@ def _format_dm(title: str, cwd: str) -> str:
         parts.append(f"📂 `{cwd_short}`")
     parts.append("🔗 Remote control: <https://claude.ai/code>")
     return "\n".join(parts)
+
+
+def _delay_for(category: str) -> float:
+    raw = os.environ.get(DELAY_ENV_VARS[category], "")
+    if raw.strip():
+        try:
+            v = float(raw)
+            return max(0.0, v)
+        except ValueError:
+            pass
+    return DEFAULT_DELAYS[category]
+
+
+def _classify(event: str, notif_type: str, stopfail_reason: str):
+    """Return (category, title) for this hook event, or (None, None) to skip."""
+    if event == "Stop":
+        return ("stop", "✅ Claude Code finished its turn and is waiting on you")
+    if event == "StopFailure":
+        reason_titles = {
+            "rate_limit":            "rate limited",
+            "authentication_failed": "authentication failed",
+            "oauth_org_not_allowed": "org not allowed",
+            "billing_error":         "billing error",
+            "max_output_tokens":     "hit output token limit",
+            "invalid_request":       "invalid request",
+            "server_error":          "server error",
+        }
+        readable = reason_titles.get(stopfail_reason, stopfail_reason or "unknown error")
+        return ("error", f"🛑 Claude Code stopped — {readable}")
+    if event == "Notification":
+        if notif_type == "permission_prompt":
+            return ("permission", "🔐 Claude needs your approval to run a tool")
+        if notif_type == "idle_prompt":
+            return ("question", "❓ Claude is asking you a question")
+    return (None, None)
 
 
 def main():
@@ -80,37 +135,17 @@ def main():
 
     event = (payload.get("hook_event_name") or "").strip()
     cwd = payload.get("cwd") or ""
+    notif_type = payload.get("notification_type") or ""
     stopfail_reason = payload.get("reason") or ""
     session_id = payload.get("session_id") or ""
 
-    key = session_id or "default"
-
-    if event == "Stop":
-        title = "✅ Claude Code finished its turn and is waiting on you"
-    elif event == "StopFailure":
-        reason_titles = {
-            "rate_limit":            "rate limited",
-            "authentication_failed": "authentication failed",
-            "oauth_org_not_allowed": "org not allowed",
-            "billing_error":         "billing error",
-            "max_output_tokens":     "hit output token limit",
-            "invalid_request":       "invalid request",
-            "server_error":          "server error",
-        }
-        readable = reason_titles.get(stopfail_reason, stopfail_reason or "unknown error")
-        title = f"🛑 Claude Code stopped — {readable}"
-    else:
-        # Anything else is out of scope now.
+    category, title = _classify(event, notif_type, stopfail_reason)
+    if category is None:
         safe_exit()
 
     text = _format_dm(title, cwd)
-
-    try:
-        delay_f = float(os.environ.get("CC_DISCORD_IDLE_DELAY", "30"))
-    except ValueError:
-        delay_f = 30.0
-    if delay_f < 0:
-        delay_f = 0.0
+    delay_f = _delay_for(category)
+    key = session_id or "default"
 
     here = Path(__file__).resolve().parent
     plugin_root = here.parent
