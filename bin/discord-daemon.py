@@ -84,6 +84,7 @@ INFO_FILE = Path(os.environ.get("CC_DISCORD_INFO", CLAUDE_DIR / "discord-daemon.
 PID_FILE = CLAUDE_DIR / "discord-daemon.pid"
 LOG_FILE = CLAUDE_DIR / "discord-daemon.log"
 INBOX_FILE = CLAUDE_DIR / "cc-discord" / "inbox.jsonl"
+AUTO_ACCEPT_FILE = CLAUDE_DIR / "cc-discord" / "auto-accept.json"
 
 GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json"
 API_BASE = "https://discord.com/api/v10"
@@ -309,7 +310,24 @@ CATEGORY_COLORS = {
     "retry_output":  0x6b7280,  # gray (prior output context)
     "retry_error":   0xb91c1c,  # deep red (final failure)
     "inbox_ack":     0x6b7280,  # gray
+    "command_on":    0x22c55e,  # green
+    "command_off":   0x6b7280,  # gray
 }
+
+
+def read_auto_accept() -> bool:
+    try:
+        return bool(json.loads(AUTO_ACCEPT_FILE.read_text(encoding="utf-8"))
+                    .get("enabled", False))
+    except Exception:
+        return False
+
+
+def write_auto_accept(enabled: bool) -> None:
+    AUTO_ACCEPT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    AUTO_ACCEPT_FILE.write_text(
+        json.dumps({"enabled": bool(enabled)}), encoding="utf-8",
+    )
 
 
 def _truncate(s: str, n: int) -> str:
@@ -671,6 +689,82 @@ class Daemon:
         elif op == 11:
             pass
 
+    async def _maybe_handle_command(self, d: dict, content: str) -> bool:
+        """Parse a DM that begins with '/'. Return True if it was a recognized
+        bot command (and was handled), False otherwise.
+
+        Recognized:
+            /autoaccept                   toggle
+            /autoaccept on | off | status
+            /aa  (alias)
+            /help
+        """
+        tokens = content.split()
+        if not tokens:
+            return False
+        cmd = tokens[0].lower().lstrip("/")
+        arg = tokens[1].lower() if len(tokens) > 1 else ""
+        channel_id = d.get("channel_id")
+
+        if cmd in ("autoaccept", "auto-accept", "aa"):
+            if arg in ("on", "enable", "yes"):
+                new_state = True
+                write_auto_accept(True)
+            elif arg in ("off", "disable", "no"):
+                new_state = False
+                write_auto_accept(False)
+            elif arg == "status":
+                new_state = read_auto_accept()
+            else:
+                new_state = not read_auto_accept()
+                write_auto_accept(new_state)
+            log.info("auto-accept set via DM command: enabled=%s (cmd=%r)",
+                     new_state, content[:80])
+            if channel_id:
+                embed = {
+                    "color": CATEGORY_COLORS["command_on"] if new_state
+                             else CATEGORY_COLORS["command_off"],
+                    "title": f"⚙️ Auto-accept is {'ON' if new_state else 'OFF'}",
+                    "description": (
+                        "All tool-permission prompts will be **auto-approved** "
+                        "without prompting you. Send `/autoaccept off` to "
+                        "disable."
+                        if new_state else
+                        "Tool-permission prompts will behave normally — you'll "
+                        "get a DM and be asked at the terminal. Send "
+                        "`/autoaccept on` to skip prompts."
+                    ),
+                }
+                try:
+                    await asyncio.to_thread(send_message, self.token,
+                                            channel_id, "", None, [embed])
+                except Exception as e:
+                    log.warning("autoaccept ack send failed: %s", e)
+            return True
+
+        if cmd == "help":
+            if channel_id:
+                embed = {
+                    "color": CATEGORY_COLORS["inbox_ack"],
+                    "title": "🤖 cc-discord bot commands",
+                    "description": (
+                        "**/autoaccept** — toggle auto-approval of tool "
+                        "permission prompts\n"
+                        "**/autoaccept on | off | status** — set explicitly\n"
+                        "**/help** — show this message\n\n"
+                        "Any non-command DM you send while idle is queued and "
+                        "delivered to Claude on your next prompt."
+                    ),
+                }
+                try:
+                    await asyncio.to_thread(send_message, self.token,
+                                            channel_id, "", None, [embed])
+                except Exception as e:
+                    log.warning("help send failed: %s", e)
+            return True
+
+        return False
+
     async def _on_message(self, d: dict):
         author = d.get("author") or {}
         if author.get("bot"):
@@ -681,6 +775,13 @@ class Daemon:
         if not content:
             return
         log.info("DM reply received: %r", content[:80])
+
+        # Slash-style DM commands handled by the bot itself. Intercepted BEFORE
+        # the pending-question resolver so a `/autoaccept` reply doesn't get
+        # consumed as the answer to a tool-approval prompt.
+        if content.startswith("/"):
+            if await self._maybe_handle_command(d, content):
+                return
 
         # Grab the oldest pending entry (the one this reply will resolve)
         # BEFORE resolving, so we still have its message_id/channel_id.

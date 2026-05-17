@@ -253,6 +253,19 @@ CATEGORY_COLORS = {
 }
 
 
+AUTO_ACCEPT_FILE = Path.home() / ".claude" / "cc-discord" / "auto-accept.json"
+
+
+def _auto_accept_enabled() -> bool:
+    """Read the user-toggled auto-accept flag set via the bot's /autoaccept
+    DM command. Missing/unreadable file means OFF (the safe default)."""
+    try:
+        return bool(json.loads(AUTO_ACCEPT_FILE.read_text(encoding="utf-8"))
+                    .get("enabled", False))
+    except Exception:
+        return False
+
+
 def _build_permission_embed(tool_name: str, tool_input: dict, cwd: str) -> dict:
     """Embed shown on Discord while a permission prompt waits in the terminal.
     Informational only — the actual decision still happens at the laptop (or
@@ -431,6 +444,13 @@ def main():
         fp = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
         if fp and is_in_scope(fp, cwd):
             allow(f"{tool_name} within session scope")
+
+    # Auto-accept: user toggled "approve everything" from Discord via
+    # /autoaccept. We still let AskUserQuestion fall through — auto-allowing
+    # a question without an answer doesn't help anyone; Claude Code would
+    # show the picker anyway.
+    if tool_name != "AskUserQuestion" and _auto_accept_enabled():
+        allow("auto-accept enabled via /autoaccept on Discord")
 
     # Daemon check before we try to ask.
     env_file = Path(os.environ.get("CC_DISCORD_ENV_FILE",
