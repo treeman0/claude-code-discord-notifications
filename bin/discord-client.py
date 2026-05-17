@@ -40,6 +40,7 @@ CLAUDE_DIR = HOME / ".claude"
 INFO_FILE = Path(os.environ.get("CC_DISCORD_INFO", CLAUDE_DIR / "discord-daemon.info"))
 PID_FILE = CLAUDE_DIR / "discord-daemon.pid"
 DAEMON_SCRIPT_ENV = "CC_DISCORD_DAEMON"
+AUTO_ACCEPT_FILE = CLAUDE_DIR / "cc-discord" / "auto-accept.json"
 
 
 def read_info():
@@ -312,6 +313,54 @@ def cmd_ask(args):
     print(resp["answer"])
 
 
+def _read_auto_accept() -> bool:
+    try:
+        return bool(json.loads(AUTO_ACCEPT_FILE.read_text(encoding="utf-8"))
+                    .get("enabled", False))
+    except Exception:
+        return False
+
+
+def _write_auto_accept(enabled: bool) -> None:
+    AUTO_ACCEPT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    AUTO_ACCEPT_FILE.write_text(
+        json.dumps({"enabled": bool(enabled)}), encoding="utf-8",
+    )
+
+
+def cmd_autoaccept(args):
+    """Local toggle for auto-accept (same state file as the Discord /autoaccept
+    DM command). Does not require the daemon to be running — just flips the
+    flag the PreToolUse hook checks on every invocation.
+
+    Subcommands:
+        autoaccept              toggle
+        autoaccept on|off       set explicitly
+        autoaccept status       show current state (exit 0 ON, exit 1 OFF)
+    """
+    action = (args.action or "toggle").lower()
+    if action in ("on", "enable", "yes"):
+        _write_auto_accept(True)
+        new_state = True
+    elif action in ("off", "disable", "no"):
+        _write_auto_accept(False)
+        new_state = False
+    elif action == "status":
+        new_state = _read_auto_accept()
+    elif action == "toggle":
+        new_state = not _read_auto_accept()
+        _write_auto_accept(new_state)
+    else:
+        print(f"error: unknown action {action!r} "
+              "(use: toggle | on | off | status)", file=sys.stderr)
+        sys.exit(2)
+    label = "ON" if new_state else "OFF"
+    print(f"auto-accept is {label}")
+    # Make it usable in shell pipelines: status mirrors state in exit code.
+    if action == "status":
+        sys.exit(0 if new_state else 1)
+
+
 def cmd_status(args):
     if not daemon_alive():
         print("not running")
@@ -400,6 +449,18 @@ def main():
 
     p_status = sub.add_parser("status", help="Check daemon status")
     p_status.set_defaults(func=cmd_status)
+
+    p_auto = sub.add_parser(
+        "autoaccept",
+        help="Toggle auto-approval of all tool-permission prompts "
+             "(same flag the Discord /autoaccept DM command sets).",
+    )
+    p_auto.add_argument(
+        "action", nargs="?", default="toggle",
+        choices=["toggle", "on", "off", "status"],
+        help="toggle (default), on, off, or status",
+    )
+    p_auto.set_defaults(func=cmd_autoaccept)
 
     p_stop = sub.add_parser("stop", help="Stop the daemon")
     p_stop.set_defaults(func=cmd_stop)
