@@ -247,6 +247,111 @@ def _short_cwd(cwd: str) -> str:
         return cwd
 
 
+CATEGORY_COLORS = {
+    "permission": 0xeab308,  # amber
+    "question":   0x3b82f6,  # blue
+}
+
+
+def _build_permission_embed(tool_name: str, tool_input: dict, cwd: str) -> dict:
+    """Embed shown on Discord while a permission prompt waits in the terminal.
+    Informational only — the actual decision still happens at the laptop (or
+    by reply, which is queued for the next prompt via the inbox)."""
+    lines = []
+    if tool_name == "Bash":
+        cmd = truncate(tool_input.get("command", ""), 400)
+        desc = truncate(tool_input.get("description", ""), 120)
+        lines.append(f"**Bash**")
+        if desc:
+            lines.append(f"_{desc}_")
+        lines.append(f"```bash\n{cmd}\n```")
+    elif tool_name in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+        path = tool_input.get("file_path") or tool_input.get("notebook_path") or "(unknown path)"
+        lines.append(f"**{tool_name}**  `{_short_path(path)}`")
+    elif tool_name.startswith("mcp__"):
+        lines.append(f"**{tool_name}**")
+    else:
+        lines.append(f"**{tool_name}**")
+        body = truncate(json.dumps(tool_input, separators=(',', ':')), 300)
+        lines.append(f"```json\n{body}\n```")
+    lines.append("🔗 [Open Claude Code](https://claude.ai/code)")
+    embed = {
+        "color": CATEGORY_COLORS["permission"],
+        "title": "🔐 Claude needs your approval to run a tool",
+        "description": "\n".join(lines),
+    }
+    short_cwd = _short_cwd(cwd)
+    if short_cwd:
+        embed["footer"] = {"text": f"📂 {short_cwd}"}
+    return embed
+
+
+def _build_question_embed(tool_input: dict, cwd: str) -> dict:
+    """Embed shown on Discord when Claude calls AskUserQuestion. The terminal
+    picker still answers it; this DM lets the user know it's there."""
+    questions = tool_input.get("questions") or []
+    first = questions[0] if questions else {}
+    qtext = (first.get("question") or "").strip() or "(no question text)"
+    options = first.get("options") or []
+    lines = [truncate(qtext, 1500)]
+    if options:
+        opt_lines = []
+        for o in options[:6]:
+            label = (o.get("label") or "").strip()
+            desc = (o.get("description") or "").strip()
+            if label and desc:
+                opt_lines.append(f"• **{truncate(label, 60)}** — {truncate(desc, 160)}")
+            elif label:
+                opt_lines.append(f"• **{truncate(label, 60)}**")
+        if opt_lines:
+            lines.append("")
+            lines.extend(opt_lines)
+    lines.append("")
+    lines.append("🔗 [Open Claude Code](https://claude.ai/code)")
+    embed = {
+        "color": CATEGORY_COLORS["question"],
+        "title": "❓ Claude is asking you a question",
+        "description": "\n".join(lines),
+    }
+    short_cwd = _short_cwd(cwd)
+    if short_cwd:
+        embed["footer"] = {"text": f"📂 {short_cwd}"}
+    return embed
+
+
+def _fire_and_forget_notify(embed: dict):
+    """Send an immediate Discord DM via the daemon, without blocking the hook.
+    Spawned as a detached subprocess so PreToolUse returns instantly. Failures
+    are silent — the terminal prompt is still the source of truth."""
+    here = Path(__file__).resolve().parent
+    plugin_root = here.parent
+    client = plugin_root / "bin" / "discord-client.py"
+    daemon = plugin_root / "bin" / "discord-daemon.py"
+    if not client.exists():
+        return
+    env = os.environ.copy()
+    env["CC_DISCORD_DAEMON"] = str(daemon)
+    cmd = [
+        sys.executable, str(client), "notify",
+        "--embed-json", json.dumps(embed),
+        "",
+    ]
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "env": env,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = 0x00000200 | 0x00000008
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen(cmd, **kwargs)
+    except Exception:
+        pass
+
+
 def build_prompt(tool_name: str, tool_input: dict, cwd: str) -> str:
     """Compose a short Discord prompt summarizing the tool call.
 
@@ -360,17 +465,21 @@ def main():
     #     terminal. Terminal is hidden during the race.
     permission_mode = os.environ.get("CC_DISCORD_PERMISSION_MODE", "parallel").lower()
 
-    # AskUserQuestion: let Claude Code's native picker handle it. We tried
-    # a terminal+Discord race here but Claude Code's TUI repaints over any
-    # CONOUT$ writes on Windows, so the custom prompt was unreliable. The
-    # native picker is the only consistently visible terminal UI.
+    # AskUserQuestion: terminal picker is the source of truth (Claude Code's
+    # TUI repaints over our writes on Windows, so we never tried to take over
+    # the prompt). But we DO send a Discord DM informing the user, so they
+    # know on their phone that Claude is waiting on them.
     if tool_name == "AskUserQuestion":
+        _fire_and_forget_notify(_build_question_embed(tool_input, cwd))
         ask_fallback("AskUserQuestion handled by native picker")
         return  # not reached
 
-    # parallel mode: defer to terminal + leave it to notify.py to send
-    # the Discord prompt. No Discord interaction from this hook.
+    # parallel mode: send an immediate Discord DM so the user knows on their
+    # phone that approval is needed, then defer the actual decision to the
+    # terminal. We don't rely on the Notification(permission_prompt) hook
+    # — Claude Code doesn't fire it reliably in all flows.
     if permission_mode == "parallel":
+        _fire_and_forget_notify(_build_permission_embed(tool_name, tool_input, cwd))
         ask_fallback("parallel mode — terminal and Discord prompted simultaneously")
         return  # not reached
 
